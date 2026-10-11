@@ -799,6 +799,46 @@ test('真实延迟探测：真实 GET 延迟超过 realDelayMs 触发切换（si
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
 });
 
+test('真实延迟探测：sing-box 探测不慢（608ms）但真实访问超阈值触发切换', async () => {
+  // 典型盲区：sing-box 探测 608ms（< maxDelayMs=2000，不触发绝对慢，也不触发择优），
+  // 但真实访问 150ms 超过 realDelayMs=100（相对探测阈值而言「真实慢」），应由真实延迟探测兜底触发切换
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 608 }), // 所有节点同 608ms，不触发绝对慢/择优/劣化
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // 真实访问 150ms > realDelayMs=100
+  const httpGetImpl = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return { body: 'ok' };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 100, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1'], 'sing-box 探测不慢但真实访问慢应触发切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+});
+
 test('真实延迟探测：真实 GET 延迟未超过 realDelayMs 不触发切换', async () => {
   let currentNow = 'n0';
   const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
