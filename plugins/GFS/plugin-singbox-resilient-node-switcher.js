@@ -442,12 +442,13 @@ function createMonitor({ api, config, clock, logger }) {
       return { skipped: true, switchedTo: null, error: null };
     }
     cycleInProgress = true;
-    controller = new AbortController();
+    const cycleController = new AbortController();
+    controller = cycleController;
 
     try {
       let data;
       try {
-        data = await api.getProxies(controller.signal);
+        data = await api.getProxies(cycleController.signal);
       } catch (error) {
         lastError = error?.message || String(error);
         log.error('无法读取主 Selector 状态', lastError);
@@ -518,7 +519,7 @@ function createMonitor({ api, config, clock, logger }) {
       const probeOrder = members;
       for (let i = 0; i < probeOrder.length; i += cfg.concurrency) {
         const batch = probeOrder.slice(i, i + cfg.concurrency);
-        await Promise.all(batch.map((tag) => runProbe(tag, controller.signal)));
+        await Promise.all(batch.map((tag) => runProbe(tag, cycleController.signal)));
       }
 
       // 判断当前节点是否故障并满足驻留时间
@@ -538,7 +539,7 @@ function createMonitor({ api, config, clock, logger }) {
         if (candidates.length > 0) {
           const target = candidates[0];
           try {
-            await api.select(cfg.selectorName, target, controller.signal);
+            await api.select(cfg.selectorName, target, cycleController.signal);
           } catch (error) {
             log.warn(`切换到 ${target} 失败`, error?.message || String(error));
             currentStartAt = now;
@@ -548,7 +549,7 @@ function createMonitor({ api, config, clock, logger }) {
           // 三段式确认：刷新并核对 now
           let confirmNow = null;
           try {
-            const refreshed = await api.getProxies(controller.signal);
+            const refreshed = await api.getProxies(cycleController.signal);
             confirmNow = refreshed?.proxies?.[cfg.selectorName]?.now ?? null;
           } catch (error) {
             confirmNow = null;

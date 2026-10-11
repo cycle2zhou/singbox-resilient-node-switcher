@@ -211,3 +211,34 @@ test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', as
     '应记录切换确认失败',
   );
 });
+
+test('探测进行中调用 stop 不抛 null 异常（controller 已被置空仍安全）', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+
+  let releaseN0;
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async (tag) => {
+      if (tag === 'n0') {
+        return new Promise((resolve) => { releaseN0 = resolve; });
+      }
+      return { ok: false, reason: 'timeout' };
+    },
+  });
+
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, concurrency: 1 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+  });
+
+  const cycle = monitor.runCycle();
+  await new Promise((r) => setTimeout(r, 10)); // 进入 n0 的挂起探测
+  monitor.stop(); // 此时 controller 被置空，进行中的轮次不应崩溃
+  releaseN0({ ok: true, delay: 50 }); // 释放 n0，轮次继续探测 n1/n2
+
+  await cycle; // 修复前会因 null.signal 抛异常；修复后应正常完成
+  assert.equal(monitor.getSnapshot().cycleInProgress, false);
+});
