@@ -238,6 +238,23 @@ export function createMonitor({ api, config, clock, logger }) {
       lastObservedNow = observedNow;
       currentNow = observedNow;
 
+      // GFS 实时测速会改写节点名（追加 IP/延迟/速度/序号后缀），
+      // 若 members 仅在 poolCycle 更新而 currentNow 在 watchCycle 更新，
+      // 两次响应间节点名漂移会导致精确匹配失效、UI 无法标识当前节点。
+      // 因此此处让 members 与 currentNow 取自同一次响应。
+      const all = Array.isArray(selector.all) ? selector.all : [];
+      if (all.length > 0) {
+        members = [...all];
+        memberTypes = {};
+        for (const tag of members) {
+          memberTypes[tag] = proxies[tag]?.type ?? 'unknown';
+          ensureNodeState(tag);
+        }
+        for (const tag of [...nodeStates.keys()]) {
+          if (!members.includes(tag)) nodeStates.delete(tag);
+        }
+      }
+
       lastError = null;
 
       // 只探测当前 now，探测 URL 按轮次轮换

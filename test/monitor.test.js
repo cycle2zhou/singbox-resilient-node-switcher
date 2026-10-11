@@ -362,6 +362,36 @@ test('外部 now 变化接受新选择、重置快探窗口、不切回', async 
   assert.equal(snap.channelA.failureCount, 1, '新选择节点失败窗口应从零重新累积');
 });
 
+test('动态节点名漂移时 watchCycle 同步 members 使 currentNow 可被精确匹配', async () => {
+  // 模拟 GFS 实时测速改写节点名（追加 IP 后缀），两次响应间节点名漂移
+  let version = 1;
+  const proxies = () => selectorProxy(
+    `node-a | ip${version}`,
+    [`node-a | ip${version}`, `node-b | ip${version}`],
+    leafTypes([`node-a | ip${version}`, `node-b | ip${version}`]),
+  );
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 1 }),
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+
+  await monitor.watchCycle();
+  let snap = monitor.getSnapshot();
+  assert.equal(snap.currentNow, 'node-a | ip1');
+  assert.ok(snap.members.includes(snap.currentNow), 'currentNow 应在 members 中');
+
+  version = 2;
+  await monitor.watchCycle();
+
+  snap = monitor.getSnapshot();
+  assert.equal(snap.currentNow, 'node-a | ip2');
+  assert.ok(snap.members.includes(snap.currentNow), '漂移后 currentNow 仍应在 members 中');
+  assert.deepEqual([...snap.members].sort(), ['node-a | ip2', 'node-b | ip2']);
+});
+
 test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', async () => {
   let currentNow = 'n0';
   const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
