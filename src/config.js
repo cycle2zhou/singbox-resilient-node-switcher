@@ -1,27 +1,42 @@
 export const DEFAULT_CONFIG = Object.freeze({
-  intervalMs: 30000,
-  timeoutMs: 5000,
-  concurrency: 3,
+  selectorName: '🚀 节点选择',
+  probeUrls: Object.freeze([
+    'https://www.gstatic.com/generate_204',
+    'https://cp.cloudflare.com/generate_204',
+    'https://www.google.com/generate_204',
+  ]),
+  watchIntervalMs: 10000,
+  watchTimeoutMs: 4000,
+  poolRefreshIntervalMs: 180000,
+  poolTimeoutMs: 5000,
+  poolConcurrency: 20,
+  poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
   recoveryThreshold: 2,
   initialCooldownMs: 120000,
   maxCooldownMs: 1800000,
   minDwellMs: 60000,
-  selectorName: '🚀 节点选择',
-  probeUrl: 'https://www.gstatic.com/generate_204',
+  degradationRatio: 3,
+  degradationThreshold: 2,
+  baselineWindow: 5,
 });
 
 const POSITIVE_KEYS = [
-  'intervalMs',
-  'timeoutMs',
+  'watchIntervalMs',
+  'watchTimeoutMs',
+  'poolRefreshIntervalMs',
+  'poolTimeoutMs',
   'initialCooldownMs',
   'minDwellMs',
+  'degradationRatio',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
-  'concurrency',
+  'poolConcurrency',
   'failureThreshold',
   'recoveryThreshold',
+  'degradationThreshold',
+  'baselineWindow',
 ];
 
 function positiveNumber(value, fallback) {
@@ -30,6 +45,16 @@ function positiveNumber(value, fallback) {
 
 function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function normalizeProbeUrls(value) {
+  if (!Array.isArray(value)) return DEFAULT_CONFIG.probeUrls;
+  const filtered = value.filter((url) => typeof url === 'string' && url.trim());
+  return filtered.length > 0 ? filtered : DEFAULT_CONFIG.probeUrls;
+}
+
+function normalizePoolFailureRateThreshold(value, fallback) {
+  return Number.isFinite(value) && value > 0 && value <= 1 ? value : fallback;
 }
 
 export function normalizeConfig(input = {}) {
@@ -50,9 +75,11 @@ export function normalizeConfig(input = {}) {
     ? source.selectorName
     : DEFAULT_CONFIG.selectorName;
 
-  config.probeUrl = typeof source.probeUrl === 'string' && source.probeUrl.trim()
-    ? source.probeUrl
-    : DEFAULT_CONFIG.probeUrl;
+  config.probeUrls = normalizeProbeUrls(source.probeUrls);
+  config.poolFailureRateThreshold = normalizePoolFailureRateThreshold(
+    source.poolFailureRateThreshold,
+    DEFAULT_CONFIG.poolFailureRateThreshold,
+  );
 
   return config;
 }
