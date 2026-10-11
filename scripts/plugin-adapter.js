@@ -122,8 +122,10 @@ export default (Plugin) => {
       api: apiClient,
       config,
       clock: Date,
-      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）
-      httpGetImpl: (url) => Plugins.HttpGet(url),
+      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）。
+      // 传 Connection: close 强制每次新建连接（含 TLS 握手），避免 Go http.Client 复用连接
+      // 跳过 TLS 握手导致延迟系统性低估（实测复用连接 ~0.7s vs 新建连接 1.7~4.6s）。
+      httpGetImpl: (url) => Plugins.HttpGet(url, { Connection: 'close' }),
       logger: {
         info: (...args) => console.log(`[${Plugin.name}]`, ...args),
         warn: (...args) => console.warn(`[${Plugin.name}]`, ...args),
