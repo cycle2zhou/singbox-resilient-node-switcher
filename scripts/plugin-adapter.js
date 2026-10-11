@@ -60,6 +60,13 @@ export default (Plugin) => {
       stalkProbeDelayMs: Number(Plugin.StalkProbeDelayMs),
       stalkSuccessThreshold: Number(Plugin.StalkSuccessThreshold),
       preSwitchMaxProbe: Number(Plugin.PreSwitchMaxProbe),
+      realProbeEnabled: Plugin.RealProbeEnabled,
+      realProbeUrls: typeof Plugin.RealProbeUrls === 'string'
+        ? Plugin.RealProbeUrls.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      realDelayMs: Number(Plugin.RealDelayMs),
+      realProbeTimeoutMs: Number(Plugin.RealProbeTimeoutMs),
+      realSlowThreshold: Number(Plugin.RealSlowThreshold),
     };
   }
 

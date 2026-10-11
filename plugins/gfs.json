@@ -228,6 +228,51 @@
       "component": "Input",
       "value": "3",
       "options": []
+    },
+    {
+      "id": "ID_real_probe_enabled",
+      "title": "真实延迟探测",
+      "description": "sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟（实测低 3~6 倍）。开启后用 fetch 走系统代理发起真实 GET 并读响应体，测到用户实际感知延迟，作为慢判定的可靠补充",
+      "key": "RealProbeEnabled",
+      "component": "Switch",
+      "value": true,
+      "options": []
+    },
+    {
+      "id": "ID_real_probe_urls",
+      "title": "真实探测 URL 列表",
+      "description": "真实延迟探测的目标地址，逗号分隔；多 URL 全部探测取最慢延迟，至少一个成功才判健康",
+      "key": "RealProbeUrls",
+      "component": "Input",
+      "value": "https://github.com,https://www.google.com",
+      "options": []
+    },
+    {
+      "id": "ID_real_delay_ms",
+      "title": "真实延迟阈值(ms)",
+      "description": "真实 GET 延迟超过该值即计「慢」，默认 3000",
+      "key": "RealDelayMs",
+      "component": "Input",
+      "value": "3000",
+      "options": []
+    },
+    {
+      "id": "ID_real_probe_timeout_ms",
+      "title": "真实探测超时(ms)",
+      "description": "单次真实 GET 探测的超时，默认 8000",
+      "key": "RealProbeTimeoutMs",
+      "component": "Input",
+      "value": "8000",
+      "options": []
+    },
+    {
+      "id": "ID_real_slow_threshold",
+      "title": "真实慢连续次数",
+      "description": "真实 GET 连续多少次超过阈值（或全部失败）后触发切换，默认 1",
+      "key": "RealSlowThreshold",
+      "component": "Input",
+      "value": "1",
+      "options": []
     }
   ]
 }

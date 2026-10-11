@@ -11,6 +11,7 @@
 - **双通道探测**：通道 A 高频只探当前节点，快速发现故障；通道 B 低频并发扫描全部成员，维护「候选池」供切换备用，避免 195 个节点同时探测拖垮内核。
 - **延迟劣化判定**：当前节点延迟超过近期基线 `DegradationRatio` 倍且连续 `DegradationThreshold` 次，即使未超时也触发切换，捕捉「能通但慢」的劣化节点。
 - **绝对延迟阈值**：当前节点延迟超过 `MaxDelayMs` 且连续 `SlowThreshold` 次，直接判慢并触发切换，避免「探测 1.4s 但真实 2~5s」的慢节点被误判健康。
+- **真实延迟探测**：sing-box 的 `/delay` 用 HEAD 且不读 body，系统性低估真实 GET 延迟（实测低 3~6 倍）；用 fetch 走系统代理发起真实 GET 并读响应体，测到用户实际感知延迟，作为慢判定盲区的可靠补充。
 - **全池失败熔断**：候选池单轮失败率超过 `PoolFailureRateThreshold` 时作废本轮、不推进状态，避免探测目标本身故障被误判为全部节点故障。
 - **多 URL 短路探测**：`ProbeUrls` 列表按轮次轮换起始位，对同一节点依次探测、任一 URL 可达即判健康，规避单一探测 URL 被墙或 DNS 污染导致的单点误判。
 - **性能择优**：当前节点延迟超过候选池最优节点 `OptimizeRatio` 倍且连续 `OptimizeThreshold` 次，即使仍可用也切到更低延迟节点，兼顾稳定与速度。
@@ -80,6 +81,11 @@
 | 盯梢快探延迟(ms) | `StalkProbeDelayMs` | `2000` | 切换成功后多久发起一次盯梢快探验证新节点 |
 | 盯梢成功次数 | `StalkSuccessThreshold` | `2` | 盯梢期内新节点连续成功多少次后退出盯梢恢复正常阈值 |
 | 切换前复核候选数 | `PreSwitchMaxProbe` | `3` | 切换前最多复核多少个候选节点，跳过不可达者 |
+| 真实延迟探测 | `RealProbeEnabled` | `true` | sing-box 的 `/delay` 用 HEAD 且不读 body，系统性低估真实 GET 延迟（实测低 3~6 倍）；开启后用 fetch 走系统代理发起真实 GET 读 body 补盲区 |
+| 真实探测 URL 列表 | `RealProbeUrls` | `https://github.com,https://www.google.com` | 真实延迟探测目标地址，逗号分隔；全部探测取最慢延迟，至少一个成功才判健康 |
+| 真实延迟阈值(ms) | `RealDelayMs` | `3000` | 真实 GET 延迟超过该值即计「慢」 |
+| 真实探测超时(ms) | `RealProbeTimeoutMs` | `8000` | 单次真实 GET 探测的超时 |
+| 真实慢连续次数 | `RealSlowThreshold` | `1` | 真实 GET 连续多少次超阈值（或全部失败）后触发切换 |
 
 ## 状态机
 

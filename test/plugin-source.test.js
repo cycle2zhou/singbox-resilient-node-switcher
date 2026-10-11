@@ -80,6 +80,10 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     StalkProbeDelayMs: String(DEFAULT_CONFIG.stalkProbeDelayMs),
     StalkSuccessThreshold: String(DEFAULT_CONFIG.stalkSuccessThreshold),
     PreSwitchMaxProbe: String(DEFAULT_CONFIG.preSwitchMaxProbe),
+    RealProbeUrls: DEFAULT_CONFIG.realProbeUrls.join(','),
+    RealDelayMs: String(DEFAULT_CONFIG.realDelayMs),
+    RealProbeTimeoutMs: String(DEFAULT_CONFIG.realProbeTimeoutMs),
+    RealSlowThreshold: String(DEFAULT_CONFIG.realSlowThreshold),
   };
 
   for (const [key, value] of Object.entries(expected)) {
@@ -88,6 +92,12 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     assert.equal(item.component, 'Input', `配置项 ${key} 应为 Input`);
     assert.equal(item.value, value, `配置项 ${key} 默认值应与 src/config.js 一致`);
   }
+
+  // realProbeEnabled 用 Switch 组件承载布尔值
+  const realProbeEnabled = meta.configuration.find((c) => c.key === 'RealProbeEnabled');
+  assert.ok(realProbeEnabled, '缺少配置项 RealProbeEnabled');
+  assert.equal(realProbeEnabled.component, 'Switch', 'RealProbeEnabled 应为 Switch');
+  assert.equal(realProbeEnabled.value, DEFAULT_CONFIG.realProbeEnabled, 'RealProbeEnabled 默认值应与 src/config.js 一致');
 });
 
 test('插件源码读取全部双通道配置键', () => {
@@ -109,6 +119,11 @@ test('插件源码读取全部双通道配置键', () => {
     'Plugin.StalkProbeDelayMs',
     'Plugin.StalkSuccessThreshold',
     'Plugin.PreSwitchMaxProbe',
+    'Plugin.RealProbeEnabled',
+    'Plugin.RealProbeUrls',
+    'Plugin.RealDelayMs',
+    'Plugin.RealProbeTimeoutMs',
+    'Plugin.RealSlowThreshold',
   ];
   for (const key of keys) {
     assert.ok(pluginSource.includes(key), `插件源码应读取 ${key}`);

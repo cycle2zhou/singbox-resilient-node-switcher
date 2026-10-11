@@ -117,3 +117,38 @@ export function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = 
     },
   };
 }
+
+// 真实延迟探测：用 fetch 走系统代理（WebView 默认走系统代理，指向 sing-box 混合入站
+// 127.0.0.1:20122）发起真实 GET 并读取响应体，测到的是「用户实际访问延迟」。
+// 与 sing-box 的 /delay（HEAD + 不读 body，系统性低估 3~6 倍）互补，用于慢判定。
+// 返回 { ok, delay, status, reason }；ok=false 表示真实访问失败或超时。
+export async function realProbe(url, timeoutMs, fetchImpl = globalThis.fetch) {
+  if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('The operation timed out', 'TimeoutError'));
+  }, timeoutMs);
+  const start = Date.now();
+  try {
+    const response = await fetchImpl(url, {
+      signal: controller.signal,
+      method: 'GET',
+      redirect: 'follow',
+      cache: 'no-store',
+    });
+    // 读完整响应体：真实访问会下载 body，这才能真正反映用户感知的延迟
+    await response.text();
+    const delay = Date.now() - start;
+    if (!response.ok) {
+      return { ok: false, status: response.status, reason: `request failed with HTTP ${response.status}` };
+    }
+    return { ok: true, delay };
+  } catch (error) {
+    const reason = error?.name === 'AbortError' || error?.name === 'TimeoutError'
+      ? 'request timeout'
+      : (error?.message || String(error));
+    return { ok: false, reason };
+  } finally {
+    clearTimeout(timer);
+  }
+}

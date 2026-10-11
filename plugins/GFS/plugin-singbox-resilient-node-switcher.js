@@ -34,6 +34,17 @@ const DEFAULT_CONFIG = Object.freeze({
   stalkProbeDelayMs: 2000,
   stalkSuccessThreshold: 2,
   preSwitchMaxProbe: 3,
+  // 真实延迟探测：sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟
+  // （实测低 3~6 倍），导致 maxDelayMs 慢判定失效。真实延迟探测走系统代理（fetch 默认走
+  // 系统代理，指向 sing-box 混合入站）发起真实 GET 并读 body，测到的就是用户实际感知延迟。
+  realProbeEnabled: true,
+  realProbeUrls: Object.freeze([
+    'https://github.com',
+    'https://www.google.com',
+  ]),
+  realDelayMs: 3000,
+  realProbeTimeoutMs: 8000,
+  realSlowThreshold: 1,
 });
 
 const POSITIVE_KEYS = [
@@ -47,6 +58,8 @@ const POSITIVE_KEYS = [
   'degradationRatio',
   'optimizeRatio',
   'stalkProbeDelayMs',
+  'realDelayMs',
+  'realProbeTimeoutMs',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
@@ -59,6 +72,7 @@ const POSITIVE_INTEGER_KEYS = [
   'optimizeThreshold',
   'stalkSuccessThreshold',
   'preSwitchMaxProbe',
+  'realSlowThreshold',
 ];
 
 function positiveNumber(value, fallback) {
@@ -69,10 +83,10 @@ function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function normalizeProbeUrls(value) {
-  if (!Array.isArray(value)) return DEFAULT_CONFIG.probeUrls;
+function normalizeProbeUrls(value, fallback = DEFAULT_CONFIG.probeUrls) {
+  if (!Array.isArray(value)) return fallback;
   const filtered = value.filter((url) => typeof url === 'string' && url.trim());
-  return filtered.length > 0 ? filtered : DEFAULT_CONFIG.probeUrls;
+  return filtered.length > 0 ? filtered : fallback;
 }
 
 function normalizePoolFailureRateThreshold(value, fallback) {
@@ -98,6 +112,10 @@ function normalizeConfig(input = {}) {
     : DEFAULT_CONFIG.selectorName;
 
   config.probeUrls = normalizeProbeUrls(source.probeUrls);
+  config.realProbeUrls = normalizeProbeUrls(source.realProbeUrls, DEFAULT_CONFIG.realProbeUrls);
+  config.realProbeEnabled = typeof source.realProbeEnabled === 'boolean'
+    ? source.realProbeEnabled
+    : DEFAULT_CONFIG.realProbeEnabled;
   config.poolFailureRateThreshold = normalizePoolFailureRateThreshold(
     source.poolFailureRateThreshold,
     DEFAULT_CONFIG.poolFailureRateThreshold,
@@ -434,6 +452,41 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
   };
 }
 
+// 真实延迟探测：用 fetch 走系统代理（WebView 默认走系统代理，指向 sing-box 混合入站
+// 127.0.0.1:20122）发起真实 GET 并读取响应体，测到的是「用户实际访问延迟」。
+// 与 sing-box 的 /delay（HEAD + 不读 body，系统性低估 3~6 倍）互补，用于慢判定。
+// 返回 { ok, delay, status, reason }；ok=false 表示真实访问失败或超时。
+async function realProbe(url, timeoutMs, fetchImpl = globalThis.fetch) {
+  if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('The operation timed out', 'TimeoutError'));
+  }, timeoutMs);
+  const start = Date.now();
+  try {
+    const response = await fetchImpl(url, {
+      signal: controller.signal,
+      method: 'GET',
+      redirect: 'follow',
+      cache: 'no-store',
+    });
+    // 读完整响应体：真实访问会下载 body，这才能真正反映用户感知的延迟
+    await response.text();
+    const delay = Date.now() - start;
+    if (!response.ok) {
+      return { ok: false, status: response.status, reason: `request failed with HTTP ${response.status}` };
+    }
+    return { ok: true, delay };
+  } catch (error) {
+    const reason = error?.name === 'AbortError' || error?.name === 'TimeoutError'
+      ? 'request timeout'
+      : (error?.message || String(error));
+    return { ok: false, reason };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 // ---- src/monitor.js ----
 
@@ -462,7 +515,7 @@ function stableKey(tag) {
   return m ? m[1].trim() : tag;
 }
 
-function createMonitor({ api, config, clock, logger }) {
+function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetch }) {
   const cfg = normalizeConfig(config);
   const time = clock && typeof clock.now === 'function' ? clock : Date;
   const log = logger && typeof logger.info === 'function' ? logger : silentLogger();
@@ -490,6 +543,8 @@ function createMonitor({ api, config, clock, logger }) {
   let watchDegradationCount = 0;
   let watchOptimizeCount = 0;
   let watchSlowCount = 0;
+  let realSlowCount = 0;
+  let realDelay = null;
   let watchCycleCount = 0;
   let poolCycleCount = 0;
   // 盯梢期：切换后短窗口内快速失败快速切换，待新节点稳定后退出
@@ -533,6 +588,28 @@ function createMonitor({ api, config, clock, logger }) {
       last = result;
     }
     return { ok: false, result: last };
+  }
+
+  // 真实延迟多 URL 探测：依次用 fetch 走系统代理发起真实 GET 并读 body。
+  // 至少一个 URL 真实访问成功即返回「最慢延迟」（用户感知的是最慢的站点）；
+  // 全部失败才返回失败（视为「HEAD 通但 GET 不通」的盲区）。
+  async function realProbeAny(urls, timeoutMs) {
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return { ok: false, result: null };
+    }
+    let slowest = null;
+    for (const url of urls) {
+      let result;
+      try {
+        result = await realProbe(url, timeoutMs, fetchImpl);
+      } catch (error) {
+        result = { ok: false, reason: error?.message || String(error) };
+      }
+      if (result && result.ok && (slowest === null || result.delay > slowest.delay)) {
+        slowest = result;
+      }
+    }
+    return slowest ? { ok: true, result: slowest } : { ok: false, result: null };
   }
 
   // 返回候选池中延迟最小的节点 {tag, delay}；候选池为空或全无延迟时返回 null
@@ -720,6 +797,8 @@ function createMonitor({ api, config, clock, logger }) {
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
+        realSlowCount = 0;
+        realDelay = null;
         stalking = false;
         stalkingSuccessCount = 0;
         currentStartAt = now;
@@ -786,6 +865,20 @@ function createMonitor({ api, config, clock, logger }) {
           watchSlowCount = 0;
         }
 
+        // 真实延迟探测：sing-box 的 /delay 用 HEAD 不读 body，系统性低估真实 GET 延迟，
+        // 用 fetch 走系统代理测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
+        if (cfg.realProbeEnabled) {
+          const realResult = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
+          if (realResult.ok && realResult.result) {
+            realDelay = realResult.result.delay;
+            realSlowCount = realResult.result.delay > cfg.realDelayMs ? realSlowCount + 1 : 0;
+          } else {
+            // 真实访问全部失败：sing-box 探测通但真实 GET 不通，视为慢/故障盲区
+            realDelay = null;
+            realSlowCount += 1;
+          }
+        }
+
         // 性能择优：当前节点延迟明显高于候选池最优时累积计数，连续达标后切到最优节点
         const best = bestCandidate();
         if (best && result.delay > best.delay * cfg.optimizeRatio) {
@@ -798,6 +891,8 @@ function createMonitor({ api, config, clock, logger }) {
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
+        realSlowCount = 0;
+        realDelay = null;
       }
 
       const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
@@ -807,6 +902,7 @@ function createMonitor({ api, config, clock, logger }) {
       const shouldSwitch = (watchFailureCount >= effectiveFailureThreshold)
         || (watchDegradationCount >= cfg.degradationThreshold)
         || (watchSlowCount >= cfg.slowThreshold)
+        || (realSlowCount >= cfg.realSlowThreshold)
         || optimizeTriggered;
       const dwellSatisfied = now >= (currentStartAt ?? now) + effectiveMinDwellMs;
 
@@ -855,6 +951,8 @@ function createMonitor({ api, config, clock, logger }) {
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
           watchSlowCount = 0;
+          realSlowCount = 0;
+          realDelay = null;
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
@@ -879,6 +977,8 @@ function createMonitor({ api, config, clock, logger }) {
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
           watchSlowCount = 0;
+          realSlowCount = 0;
+          realDelay = null;
           stalking = true;
           stalkingSuccessCount = 0;
           scheduleStalkProbe();
@@ -893,6 +993,8 @@ function createMonitor({ api, config, clock, logger }) {
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
+        realSlowCount = 0;
+        realDelay = null;
         return { skipped: false, switchedTo: null, error: lastError };
       }
 
@@ -961,6 +1063,8 @@ function createMonitor({ api, config, clock, logger }) {
         degradationCount: watchDegradationCount,
         optimizeCount: watchOptimizeCount,
         slowCount: watchSlowCount,
+        realSlowCount,
+        realDelay,
         stalking,
         stalkingSuccessCount,
       },
@@ -1049,6 +1153,13 @@ export default (Plugin) => {
       stalkProbeDelayMs: Number(Plugin.StalkProbeDelayMs),
       stalkSuccessThreshold: Number(Plugin.StalkSuccessThreshold),
       preSwitchMaxProbe: Number(Plugin.PreSwitchMaxProbe),
+      realProbeEnabled: Plugin.RealProbeEnabled,
+      realProbeUrls: typeof Plugin.RealProbeUrls === 'string'
+        ? Plugin.RealProbeUrls.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      realDelayMs: Number(Plugin.RealDelayMs),
+      realProbeTimeoutMs: Number(Plugin.RealProbeTimeoutMs),
+      realSlowThreshold: Number(Plugin.RealSlowThreshold),
     };
   }
 

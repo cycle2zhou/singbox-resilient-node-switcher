@@ -1,5 +1,6 @@
 import { normalizeConfig } from './config.js';
 import { createNodeState } from './model.js';
+import { realProbe } from './api.js';
 import {
   getProbePlan,
   recordProbeSuccess,
@@ -32,7 +33,7 @@ function stableKey(tag) {
   return m ? m[1].trim() : tag;
 }
 
-export function createMonitor({ api, config, clock, logger }) {
+export function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetch }) {
   const cfg = normalizeConfig(config);
   const time = clock && typeof clock.now === 'function' ? clock : Date;
   const log = logger && typeof logger.info === 'function' ? logger : silentLogger();
@@ -60,6 +61,8 @@ export function createMonitor({ api, config, clock, logger }) {
   let watchDegradationCount = 0;
   let watchOptimizeCount = 0;
   let watchSlowCount = 0;
+  let realSlowCount = 0;
+  let realDelay = null;
   let watchCycleCount = 0;
   let poolCycleCount = 0;
   // 盯梢期：切换后短窗口内快速失败快速切换，待新节点稳定后退出
@@ -103,6 +106,28 @@ export function createMonitor({ api, config, clock, logger }) {
       last = result;
     }
     return { ok: false, result: last };
+  }
+
+  // 真实延迟多 URL 探测：依次用 fetch 走系统代理发起真实 GET 并读 body。
+  // 至少一个 URL 真实访问成功即返回「最慢延迟」（用户感知的是最慢的站点）；
+  // 全部失败才返回失败（视为「HEAD 通但 GET 不通」的盲区）。
+  async function realProbeAny(urls, timeoutMs) {
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return { ok: false, result: null };
+    }
+    let slowest = null;
+    for (const url of urls) {
+      let result;
+      try {
+        result = await realProbe(url, timeoutMs, fetchImpl);
+      } catch (error) {
+        result = { ok: false, reason: error?.message || String(error) };
+      }
+      if (result && result.ok && (slowest === null || result.delay > slowest.delay)) {
+        slowest = result;
+      }
+    }
+    return slowest ? { ok: true, result: slowest } : { ok: false, result: null };
   }
 
   // 返回候选池中延迟最小的节点 {tag, delay}；候选池为空或全无延迟时返回 null
@@ -290,6 +315,8 @@ export function createMonitor({ api, config, clock, logger }) {
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
+        realSlowCount = 0;
+        realDelay = null;
         stalking = false;
         stalkingSuccessCount = 0;
         currentStartAt = now;
@@ -356,6 +383,20 @@ export function createMonitor({ api, config, clock, logger }) {
           watchSlowCount = 0;
         }
 
+        // 真实延迟探测：sing-box 的 /delay 用 HEAD 不读 body，系统性低估真实 GET 延迟，
+        // 用 fetch 走系统代理测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
+        if (cfg.realProbeEnabled) {
+          const realResult = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
+          if (realResult.ok && realResult.result) {
+            realDelay = realResult.result.delay;
+            realSlowCount = realResult.result.delay > cfg.realDelayMs ? realSlowCount + 1 : 0;
+          } else {
+            // 真实访问全部失败：sing-box 探测通但真实 GET 不通，视为慢/故障盲区
+            realDelay = null;
+            realSlowCount += 1;
+          }
+        }
+
         // 性能择优：当前节点延迟明显高于候选池最优时累积计数，连续达标后切到最优节点
         const best = bestCandidate();
         if (best && result.delay > best.delay * cfg.optimizeRatio) {
@@ -368,6 +409,8 @@ export function createMonitor({ api, config, clock, logger }) {
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
+        realSlowCount = 0;
+        realDelay = null;
       }
 
       const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
@@ -377,6 +420,7 @@ export function createMonitor({ api, config, clock, logger }) {
       const shouldSwitch = (watchFailureCount >= effectiveFailureThreshold)
         || (watchDegradationCount >= cfg.degradationThreshold)
         || (watchSlowCount >= cfg.slowThreshold)
+        || (realSlowCount >= cfg.realSlowThreshold)
         || optimizeTriggered;
       const dwellSatisfied = now >= (currentStartAt ?? now) + effectiveMinDwellMs;
 
@@ -425,6 +469,8 @@ export function createMonitor({ api, config, clock, logger }) {
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
           watchSlowCount = 0;
+          realSlowCount = 0;
+          realDelay = null;
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
@@ -449,6 +495,8 @@ export function createMonitor({ api, config, clock, logger }) {
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
           watchSlowCount = 0;
+          realSlowCount = 0;
+          realDelay = null;
           stalking = true;
           stalkingSuccessCount = 0;
           scheduleStalkProbe();
@@ -463,6 +511,8 @@ export function createMonitor({ api, config, clock, logger }) {
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
+        realSlowCount = 0;
+        realDelay = null;
         return { skipped: false, switchedTo: null, error: lastError };
       }
 
@@ -531,6 +581,8 @@ export function createMonitor({ api, config, clock, logger }) {
         degradationCount: watchDegradationCount,
         optimizeCount: watchOptimizeCount,
         slowCount: watchSlowCount,
+        realSlowCount,
+        realDelay,
         stalking,
         stalkingSuccessCount,
       },

@@ -26,6 +26,17 @@ export const DEFAULT_CONFIG = Object.freeze({
   stalkProbeDelayMs: 2000,
   stalkSuccessThreshold: 2,
   preSwitchMaxProbe: 3,
+  // 真实延迟探测：sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟
+  // （实测低 3~6 倍），导致 maxDelayMs 慢判定失效。真实延迟探测走系统代理（fetch 默认走
+  // 系统代理，指向 sing-box 混合入站）发起真实 GET 并读 body，测到的就是用户实际感知延迟。
+  realProbeEnabled: true,
+  realProbeUrls: Object.freeze([
+    'https://github.com',
+    'https://www.google.com',
+  ]),
+  realDelayMs: 3000,
+  realProbeTimeoutMs: 8000,
+  realSlowThreshold: 1,
 });
 
 const POSITIVE_KEYS = [
@@ -39,6 +50,8 @@ const POSITIVE_KEYS = [
   'degradationRatio',
   'optimizeRatio',
   'stalkProbeDelayMs',
+  'realDelayMs',
+  'realProbeTimeoutMs',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
@@ -51,6 +64,7 @@ const POSITIVE_INTEGER_KEYS = [
   'optimizeThreshold',
   'stalkSuccessThreshold',
   'preSwitchMaxProbe',
+  'realSlowThreshold',
 ];
 
 function positiveNumber(value, fallback) {
@@ -61,10 +75,10 @@ function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function normalizeProbeUrls(value) {
-  if (!Array.isArray(value)) return DEFAULT_CONFIG.probeUrls;
+function normalizeProbeUrls(value, fallback = DEFAULT_CONFIG.probeUrls) {
+  if (!Array.isArray(value)) return fallback;
   const filtered = value.filter((url) => typeof url === 'string' && url.trim());
-  return filtered.length > 0 ? filtered : DEFAULT_CONFIG.probeUrls;
+  return filtered.length > 0 ? filtered : fallback;
 }
 
 function normalizePoolFailureRateThreshold(value, fallback) {
@@ -90,6 +104,10 @@ export function normalizeConfig(input = {}) {
     : DEFAULT_CONFIG.selectorName;
 
   config.probeUrls = normalizeProbeUrls(source.probeUrls);
+  config.realProbeUrls = normalizeProbeUrls(source.realProbeUrls, DEFAULT_CONFIG.realProbeUrls);
+  config.realProbeEnabled = typeof source.realProbeEnabled === 'boolean'
+    ? source.realProbeEnabled
+    : DEFAULT_CONFIG.realProbeEnabled;
   config.poolFailureRateThreshold = normalizePoolFailureRateThreshold(
     source.poolFailureRateThreshold,
     DEFAULT_CONFIG.poolFailureRateThreshold,

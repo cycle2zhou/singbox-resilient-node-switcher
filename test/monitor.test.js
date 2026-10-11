@@ -47,7 +47,7 @@ function makeApi(overrides = {}) {
   };
 }
 
-const fastConfig = { ...DEFAULT_CONFIG, minDwellMs: 1 };
+const fastConfig = { ...DEFAULT_CONFIG, minDwellMs: 1, realProbeEnabled: false };
 
 test('通道 B 同步成员、跳过 URLTest 与当前 now、按成员顺序产出 candidates', async () => {
   const proxies = selectorProxy('node-a', ['node-a', 'node-b', '🎈 自动选择'], {
@@ -758,4 +758,117 @@ test('切换确认失败时记 lastError 并重置 failureCount', async () => {
   const snap = monitor.getSnapshot();
   assert.match(snap.lastError, /switch confirm failed/);
   assert.equal(snap.channelA.failureCount, 0, '切换确认失败后 failureCount 应重置');
+});
+
+test('真实延迟探测：真实 GET 延迟超过 realDelayMs 触发切换（sing-box 探测不慢）', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }), // sing-box 探测快，不慢不失败不择优
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // 真实延迟探测：mock fetch 真等 50ms（> realDelayMs=30），模拟真实 GET 慢
+  const fetchImpl = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return { status: 200, ok: true, async text() { return 'ok'; } };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 30, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+    fetchImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  // 第一次 watchCycle 累积 realSlowCount（dwell 未满足），第二次 dwell 满足后触发切换
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1'], '真实 GET 延迟超阈值应触发切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+});
+
+test('真实延迟探测：真实 GET 延迟未超过 realDelayMs 不触发切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // 真实延迟 20ms < realDelayMs=100，不触发慢判定
+  const fetchImpl = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { status: 200, ok: true, async text() { return 'ok'; } };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 100, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+    fetchImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  for (let i = 0; i < 5; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, [], '真实延迟未超阈值不应触发切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n0');
+});
+
+test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测通但真实不通）', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }), // sing-box 探测通
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // 真实访问全部失败：抛网络错误
+  const fetchImpl = async () => { throw new Error('network unreachable'); };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 30, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+    fetchImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  // sing-box 探测通但真实 GET 全失败，realSlowCount 累积触发切换
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1'], '真实访问全失败应触发切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
 });
