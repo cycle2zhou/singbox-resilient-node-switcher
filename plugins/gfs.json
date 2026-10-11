@@ -1,0 +1,116 @@
+{
+  "id": "plugin-singbox-resilient-node-switcher",
+  "version": "v0.1.0",
+  "name": "节点弹性切换",
+  "group": "Extensions",
+  "description": "面向 GUI.for.SingBox 的 Selector 健康监控与可恢复故障切换：主动探测节点延迟，连续失败后暂时冷却故障节点，冷却到期半开验证，恢复后重新参与选择；仅在验证候选成功后才切换，不永久剔除节点。",
+  "tags": ["提升体验", "功能扩展", "故障切换"],
+  "type": "Http",
+  "url": "https://raw.githubusercontent.com/GUI-for-Cores/Plugin-Hub/main/plugins/GFS/plugin-singbox-resilient-node-switcher.js",
+  "path": "data/plugins/plugin-singbox-resilient-node-switcher.js",
+  "triggers": ["on::manual", "on::core::started", "on::core::stopped", "on::shutdown"],
+  "hasUI": true,
+  "menus": {
+    "启动": "Start",
+    "停止": "Stop"
+  },
+  "context": {
+    "profiles": {},
+    "subscriptions": {},
+    "rulesets": {},
+    "plugins": {},
+    "scheduledtasks": {}
+  },
+  "configuration": [
+    {
+      "id": "ID_selector_name",
+      "title": "主 Selector 名称",
+      "description": "需要监控并切换的主策略组名称",
+      "key": "SelectorName",
+      "component": "Input",
+      "value": "🚀 节点选择",
+      "options": []
+    },
+    {
+      "id": "ID_interval_ms",
+      "title": "检测间隔(ms)",
+      "description": "监控轮次的间隔，默认 30000",
+      "key": "IntervalMs",
+      "component": "Input",
+      "value": "30000",
+      "options": []
+    },
+    {
+      "id": "ID_timeout_ms",
+      "title": "探测超时(ms)",
+      "description": "单次节点延迟探测的超时，默认 5000",
+      "key": "TimeoutMs",
+      "component": "Input",
+      "value": "5000",
+      "options": []
+    },
+    {
+      "id": "ID_concurrency",
+      "title": "并发上限",
+      "description": "同一轮次同时探测的最大节点数，默认 3",
+      "key": "Concurrency",
+      "component": "Input",
+      "value": "3",
+      "options": []
+    },
+    {
+      "id": "ID_failure_threshold",
+      "title": "失败阈值",
+      "description": "连续失败多少次后进入冷却，默认 3",
+      "key": "FailureThreshold",
+      "component": "Input",
+      "value": "3",
+      "options": []
+    },
+    {
+      "id": "ID_recovery_threshold",
+      "title": "恢复阈值",
+      "description": "半开状态下连续成功多少次后恢复健康，默认 2",
+      "key": "RecoveryThreshold",
+      "component": "Input",
+      "value": "2",
+      "options": []
+    },
+    {
+      "id": "ID_initial_cooldown_ms",
+      "title": "初始冷却(ms)",
+      "description": "首次进入冷却的时长，默认 120000",
+      "key": "InitialCooldownMs",
+      "component": "Input",
+      "value": "120000",
+      "options": []
+    },
+    {
+      "id": "ID_max_cooldown_ms",
+      "title": "最大冷却(ms)",
+      "description": "指数退避的冷却上限，默认 1800000",
+      "key": "MaxCooldownMs",
+      "component": "Input",
+      "value": "1800000",
+      "options": []
+    },
+    {
+      "id": "ID_min_dwell_ms",
+      "title": "最短驻留(ms)",
+      "description": "切换后至少驻留该时长才允许再次切换，默认 60000",
+      "key": "MinDwellMs",
+      "component": "Input",
+      "value": "60000",
+      "options": []
+    },
+    {
+      "id": "ID_probe_url",
+      "title": "探测 URL",
+      "description": "节点延迟探测的目标地址",
+      "key": "ProbeUrl",
+      "component": "Input",
+      "value": "https://www.gstatic.com/generate_204",
+      "options": []
+    }
+  ]
+}
