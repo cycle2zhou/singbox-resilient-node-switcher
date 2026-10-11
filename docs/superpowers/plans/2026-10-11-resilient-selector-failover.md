@@ -163,12 +163,14 @@
 **Files:**
 - Create: `plugins/GFS/plugin-singbox-resilient-node-switcher.js`
 - Create: `plugins/gfs.json`
+- Create: `scripts/build-plugin.js`
 - Create: `test/plugin-source.test.js`
 - Modify: `README.md`
 
 **Interfaces:**
 - Consumes: Task 1–4 的模块接口；插件运行时通过 GUI 全局 `Plugins` 注入适配器。
 - Produces: 官方插件默认导出工厂，返回 `onRun`、`onCoreStarted`、`onCoreStopped`、`onShutdown`、`onDispose`、`onUninstall` 和停止菜单处理器；元数据包含配置项与 `on::manual/on::core::started/on::core::stopped/on::shutdown` 触发器。
+- Packaging: GUI 可安装的 `plugins/GFS/plugin-singbox-resilient-node-switcher.js` 必须是自包含单文件，不能通过相对路径或运行时导入项目 `src/` 模块；使用零第三方依赖的 `scripts/build-plugin.js` 从 `src/` 模块生成可审计内联代码，或采用明确维护的等价内联实现。测试必须验证插件源码可独立解析且不包含项目模块导入，并通过构建/一致性校验确保生成文件与公共逻辑同步。
 
 - [ ] **Step 1: 写失败测试**
   - 测试插件源码可被静态语法解析，元数据 ID、路径、触发器、默认 Selector 和配置键齐全。
