@@ -3,6 +3,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   probeUrls: Object.freeze([
     'https://www.gstatic.com/generate_204',
     'https://www.google.com/generate_204',
+    'https://github.com',
   ]),
   watchIntervalMs: 10000,
   watchTimeoutMs: 4000,

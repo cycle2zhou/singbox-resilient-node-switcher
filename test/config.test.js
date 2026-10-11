@@ -9,6 +9,7 @@ test('normalizeConfig({}) 返回规格中的 18 项默认配置', () => {
   assert.deepEqual(config.probeUrls, [
     'https://www.gstatic.com/generate_204',
     'https://www.google.com/generate_204',
+    'https://github.com',
   ]);
   assert.equal(config.watchIntervalMs, 10000);
   assert.equal(config.watchTimeoutMs, 4000);

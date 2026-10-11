@@ -274,7 +274,7 @@ test('通道 B 全池失败率超过阈值时本轮作废、不推进状态', as
   assert.match(snap2.lastError, /熔断|全池|失败率/);
 });
 
-test('通道 A 快探按轮次轮换 probeUrls', async () => {
+test('通道 A 快探按轮次轮换起始探测 URL（短路多 URL）', async () => {
   const proxies = () => selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
 
   const probedUrls = [];
@@ -292,11 +292,34 @@ test('通道 A 快探按轮次轮换 probeUrls', async () => {
     await monitor.watchCycle();
   }
 
+  // mock 全部成功，短路探测每轮只探序列首个 URL，验证起始位轮换
   assert.deepEqual(probedUrls, [
     DEFAULT_CONFIG.probeUrls[0],
     DEFAULT_CONFIG.probeUrls[1],
-    DEFAULT_CONFIG.probeUrls[2 % DEFAULT_CONFIG.probeUrls.length],
+    DEFAULT_CONFIG.probeUrls[2],
   ]);
+});
+
+test('通道 B 短路多 URL：对 gstatic/google 不可达但 github 可达的节点进入候选池', async () => {
+  const proxies = selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async (node, url) => {
+      if (node === 'n1' && (url.includes('gstatic') || url.includes('google'))) {
+        return { ok: false, reason: 'HTTP 503' };
+      }
+      return { ok: true, delay: 20 };
+    },
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle();
+
+  const snap = monitor.getSnapshot();
+  assert.ok(snap.candidates.includes('n1'), '对 gstatic/google 不可达但 github 可达的节点应进入候选池');
+  assert.equal(snap.nodeStates['n1'].status, 'healthy');
+  assert.equal(snap.nodeStates['n1'].lastDelay, 20);
 });
 
 test('切换后驻留期 minDwellMs 内不二次切换', async () => {

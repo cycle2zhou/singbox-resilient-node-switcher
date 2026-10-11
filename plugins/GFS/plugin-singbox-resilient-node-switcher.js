@@ -11,6 +11,7 @@ const DEFAULT_CONFIG = Object.freeze({
   probeUrls: Object.freeze([
     'https://www.gstatic.com/generate_204',
     'https://www.google.com/generate_204',
+    'https://github.com',
   ]),
   watchIntervalMs: 10000,
   watchTimeoutMs: 4000,
@@ -479,10 +480,35 @@ function createMonitor({ api, config, clock, logger }) {
     return nodeStates.get(tag);
   }
 
-  function probeUrl(cycleCount) {
+  // 返回本轮探测 URL 序列：从 cycleCount 对应的起始位开始轮换，
+  // 使各 URL 轮流充当首个探测目标，避免固定顺序下对首个 URL 不可达的节点
+  // 每次都要先耗尽超时才能轮到可达的 URL。
+  function probeUrlSequence(cycleCount) {
     const urls = cfg.probeUrls;
-    if (!Array.isArray(urls) || urls.length === 0) return null;
-    return urls[cycleCount % urls.length];
+    if (!Array.isArray(urls) || urls.length === 0) return [];
+    const start = cycleCount % urls.length;
+    const sequence = [];
+    for (let i = 0; i < urls.length; i += 1) {
+      sequence.push(urls[(start + i) % urls.length]);
+    }
+    return sequence;
+  }
+
+  // 短路多 URL 探测：按顺序依次探测，任一 URL 成功即返回 ok；
+  // 全部失败则返回最后一个失败结果，交由调用方判定。
+  async function probeAny(node, urls, timeoutMs, signal) {
+    let last = null;
+    for (const url of urls) {
+      let result;
+      try {
+        result = await api.probe(node, url, timeoutMs, signal);
+      } catch (error) {
+        result = { ok: false, reason: error?.message || String(error) };
+      }
+      if (result && result.ok) return { ok: true, result };
+      last = result;
+    }
+    return { ok: false, result: last };
   }
 
   // 返回候选池中延迟最小的节点 {tag, delay}；候选池为空或全无延迟时返回 null
@@ -497,7 +523,7 @@ function createMonitor({ api, config, clock, logger }) {
     return best;
   }
 
-  async function runPoolProbe(tag, signal, url) {
+  async function runPoolProbe(tag, signal, urls) {
     const now = time.now();
     const state = ensureNodeState(tag);
     const plan = getProbePlan(state, now, cfg);
@@ -505,13 +531,8 @@ function createMonitor({ api, config, clock, logger }) {
     if (!plan.shouldProbe) {
       return { tag, probed: false };
     }
-    let result;
-    try {
-      result = await api.probe(tag, url, cfg.poolTimeoutMs, signal);
-    } catch (error) {
-      result = { ok: false, reason: error?.message || String(error) };
-    }
-    if (result && result.ok) {
+    const { ok, result } = await probeAny(tag, urls, cfg.poolTimeoutMs, signal);
+    if (ok) {
       nodeStates.set(tag, recordProbeSuccess(nodeStates.get(tag), now, result.delay, cfg));
       return { tag, probed: true, ok: true };
     }
@@ -578,14 +599,14 @@ function createMonitor({ api, config, clock, logger }) {
 
       currentNow = selector.now;
 
-      // 探测目标：跳过当前 now 与 URLTest，本轮统一使用一个探测 URL
+      // 探测目标：跳过当前 now 与 URLTest，本轮按轮换起始顺序探测多 URL
       const probeTargets = members.filter((tag) => tag !== currentNow && memberTypes[tag] !== 'URLTest');
-      const url = probeUrl(poolCycleCount);
+      const urls = probeUrlSequence(poolCycleCount);
 
       const results = [];
       for (let i = 0; i < probeTargets.length; i += cfg.poolConcurrency) {
         const batch = probeTargets.slice(i, i + cfg.poolConcurrency);
-        const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, url)));
+        const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls)));
         results.push(...batchResults);
       }
 
@@ -690,13 +711,16 @@ function createMonitor({ api, config, clock, logger }) {
 
       lastError = null;
 
-      // 只探测当前 now，探测 URL 按轮次轮换
-      let result;
-      try {
-        result = await api.probe(observedNow, probeUrl(watchCycleCount), cfg.watchTimeoutMs, cycleController.signal);
-      } catch (error) {
-        result = { ok: false, reason: error?.message || String(error) };
-      }
+      // 只探测当前 now，多 URL 短路探测（任一成功即健康）
+      const probeResult = await probeAny(
+        observedNow,
+        probeUrlSequence(watchCycleCount),
+        cfg.watchTimeoutMs,
+        cycleController.signal,
+      );
+      const result = probeResult.ok
+        ? probeResult.result
+        : { ok: false, reason: probeResult.result?.reason || 'probe failed' };
 
       if (result && result.ok) {
         watchBaseline.push(result.delay);
