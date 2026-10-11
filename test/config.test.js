@@ -14,6 +14,7 @@ test('normalizeConfig({}) 返回规格中的默认配置', () => {
   assert.equal(config.maxCooldownMs, 1800000);
   assert.equal(config.minDwellMs, 60000);
   assert.equal(config.selectorName, '🚀 节点选择');
+  assert.equal(config.probeUrl, 'https://www.gstatic.com/generate_204');
   assert.deepEqual(config, DEFAULT_CONFIG);
 });
 
@@ -63,4 +64,14 @@ test('并发和阈值配置只接受正整数', () => {
   assert.equal(valid.concurrency, 1);
   assert.equal(valid.failureThreshold, 2);
   assert.equal(valid.recoveryThreshold, 7);
+});
+
+test('probeUrl 配置只接受非空字符串并保留用户值', () => {
+  assert.equal(normalizeConfig({}).probeUrl, DEFAULT_CONFIG.probeUrl);
+  assert.equal(normalizeConfig({ probeUrl: 'https://example.com/204' }).probeUrl, 'https://example.com/204');
+
+  for (const value of ['', '   ', 42, null, undefined, [], {}]) {
+    const config = normalizeConfig({ probeUrl: value });
+    assert.equal(config.probeUrl, DEFAULT_CONFIG.probeUrl, `probeUrl 应拒绝 ${String(value)}`);
+  }
 });

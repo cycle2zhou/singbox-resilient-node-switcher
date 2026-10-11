@@ -8,6 +8,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   maxCooldownMs: 1800000,
   minDwellMs: 60000,
   selectorName: '🚀 节点选择',
+  probeUrl: 'https://www.gstatic.com/generate_204',
 });
 
 const POSITIVE_KEYS = [
@@ -48,6 +49,10 @@ export function normalizeConfig(input = {}) {
   config.selectorName = typeof source.selectorName === 'string' && source.selectorName.trim()
     ? source.selectorName
     : DEFAULT_CONFIG.selectorName;
+
+  config.probeUrl = typeof source.probeUrl === 'string' && source.probeUrl.trim()
+    ? source.probeUrl
+    : DEFAULT_CONFIG.probeUrl;
 
   return config;
 }
