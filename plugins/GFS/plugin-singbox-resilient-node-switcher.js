@@ -807,7 +807,7 @@ function createMonitor({ api, config, clock, logger }) {
  */
 
 export default (Plugin) => {
-  const { ref, computed, h } = Vue;
+  const { ref, computed, h, resolveComponent } = Vue;
 
   const isRunning = ref(false);
   const snapshot = ref(null);
@@ -971,8 +971,8 @@ export default (Plugin) => {
             key: 'tag',
             align: 'left',
             customRender({ value, record }) {
-              const label = record && record.isCurrent ? `${value}（当前）` : value;
-              return record && record.isCurrent ? h('b', label) : label;
+              if (!(record && record.isCurrent)) return value;
+              return h(resolveComponent('Tag'), { color: 'green' }, () => `${value}（当前）`);
             },
           },
           {
