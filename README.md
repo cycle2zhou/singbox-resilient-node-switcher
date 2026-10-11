@@ -61,8 +61,8 @@
 | 快探间隔(ms) | `WatchIntervalMs` | `10000` | 通道 A 当前节点快探的间隔 |
 | 快探超时(ms) | `WatchTimeoutMs` | `4000` | 当前节点单次快探的超时 |
 | 候选池刷新间隔(ms) | `PoolRefreshIntervalMs` | `180000` | 通道 B 候选池后台刷新的间隔 |
-| 候选池探测超时(ms) | `PoolTimeoutMs` | `2000` | 候选池单节点探测超时，缩短以加速冷启动排除死节点 |
-| 候选池并发 | `PoolConcurrency` | `30` | 候选池同批并发探测的最大节点数 |
+| 候选池探测超时(ms) | `PoolTimeoutMs` | `5000` | 候选池单节点探测超时，需足够长以适配 WebView 环境下的排队探测 |
+| 候选池并发 | `PoolConcurrency` | `20` | 候选池同批并发探测的最大节点数 |
 | 全池熔断阈值 | `PoolFailureRateThreshold` | `0.9` | 本轮失败率超过该阈值则作废本轮 |
 | 失败阈值 | `FailureThreshold` | `3` | 连续失败多少次后进入冷却 |
 | 恢复阈值 | `RecoveryThreshold` | `2` | 半开状态下连续成功多少次后恢复健康 |

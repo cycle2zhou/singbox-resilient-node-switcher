@@ -70,19 +70,19 @@
     {
       "id": "ID_pool_timeout_ms",
       "title": "候选池探测超时(ms)",
-      "description": "候选池单节点探测超时，默认 2000",
+      "description": "候选池单节点探测超时，默认 5000",
       "key": "PoolTimeoutMs",
       "component": "Input",
-      "value": "2000",
+      "value": "5000",
       "options": []
     },
     {
       "id": "ID_pool_concurrency",
       "title": "候选池并发",
-      "description": "候选池同批并发探测的最大节点数，默认 30",
+      "description": "候选池同批并发探测的最大节点数，默认 20",
       "key": "PoolConcurrency",
       "component": "Input",
-      "value": "30",
+      "value": "20",
       "options": []
     },
     {
