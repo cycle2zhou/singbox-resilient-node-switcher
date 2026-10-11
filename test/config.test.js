@@ -8,7 +8,6 @@ test('normalizeConfig({}) 返回规格中的 18 项默认配置', () => {
   assert.equal(config.selectorName, '🚀 节点选择');
   assert.deepEqual(config.probeUrls, [
     'https://www.gstatic.com/generate_204',
-    'https://cp.cloudflare.com/generate_204',
     'https://www.google.com/generate_204',
   ]);
   assert.equal(config.watchIntervalMs, 10000);

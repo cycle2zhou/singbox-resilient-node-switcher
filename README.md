@@ -57,7 +57,7 @@
 | 配置项 | 键 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | 主 Selector 名称 | `SelectorName` | `🚀 节点选择` | 需要监控并切换的主策略组 |
-| 探测 URL 列表 | `ProbeUrls` | `https://www.gstatic.com/generate_204,https://cp.cloudflare.com/generate_204,https://www.google.com/generate_204` | 节点延迟探测的目标地址，逗号分隔，按轮次轮询 |
+| 探测 URL 列表 | `ProbeUrls` | `https://www.gstatic.com/generate_204,https://www.google.com/generate_204` | 节点延迟探测的目标地址，逗号分隔，按轮次轮询 |
 | 快探间隔(ms) | `WatchIntervalMs` | `10000` | 通道 A 当前节点快探的间隔 |
 | 快探超时(ms) | `WatchTimeoutMs` | `4000` | 当前节点单次快探的超时 |
 | 候选池刷新间隔(ms) | `PoolRefreshIntervalMs` | `180000` | 通道 B 候选池后台刷新的间隔 |

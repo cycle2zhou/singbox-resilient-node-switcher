@@ -37,7 +37,7 @@
       "description": "节点延迟探测的目标地址，逗号分隔，按轮次轮询",
       "key": "ProbeUrls",
       "component": "Input",
-      "value": "https://www.gstatic.com/generate_204,https://cp.cloudflare.com/generate_204,https://www.google.com/generate_204",
+      "value": "https://www.gstatic.com/generate_204,https://www.google.com/generate_204",
       "options": []
     },
     {

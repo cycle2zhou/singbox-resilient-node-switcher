@@ -10,7 +10,6 @@ const DEFAULT_CONFIG = Object.freeze({
   selectorName: '🚀 节点选择',
   probeUrls: Object.freeze([
     'https://www.gstatic.com/generate_204',
-    'https://cp.cloudflare.com/generate_204',
     'https://www.google.com/generate_204',
   ]),
   watchIntervalMs: 10000,

@@ -295,7 +295,7 @@ test('通道 A 快探按轮次轮换 probeUrls', async () => {
   assert.deepEqual(probedUrls, [
     DEFAULT_CONFIG.probeUrls[0],
     DEFAULT_CONFIG.probeUrls[1],
-    DEFAULT_CONFIG.probeUrls[2],
+    DEFAULT_CONFIG.probeUrls[2 % DEFAULT_CONFIG.probeUrls.length],
   ]);
 });
 
