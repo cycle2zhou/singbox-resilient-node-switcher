@@ -183,6 +183,33 @@
       "component": "Input",
       "value": "3",
       "options": []
+    },
+    {
+      "id": "ID_stalk_probe_delay_ms",
+      "title": "盯梢快探延迟(ms)",
+      "description": "切换成功后多久发起一次盯梢快探验证新节点，默认 2000",
+      "key": "StalkProbeDelayMs",
+      "component": "Input",
+      "value": "2000",
+      "options": []
+    },
+    {
+      "id": "ID_stalk_success_threshold",
+      "title": "盯梢成功次数",
+      "description": "盯梢期内新节点连续成功多少次后退出盯梢恢复正常阈值，默认 2",
+      "key": "StalkSuccessThreshold",
+      "component": "Input",
+      "value": "2",
+      "options": []
+    },
+    {
+      "id": "ID_pre_switch_max_probe",
+      "title": "切换前复核候选数",
+      "description": "切换前最多复核多少个候选节点，跳过不可达者，默认 3",
+      "key": "PreSwitchMaxProbe",
+      "component": "Input",
+      "value": "3",
+      "options": []
     }
   ]
 }

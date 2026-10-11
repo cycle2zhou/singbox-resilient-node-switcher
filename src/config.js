@@ -21,6 +21,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   baselineWindow: 5,
   optimizeRatio: 2,
   optimizeThreshold: 3,
+  stalkProbeDelayMs: 2000,
+  stalkSuccessThreshold: 2,
+  preSwitchMaxProbe: 3,
 });
 
 const POSITIVE_KEYS = [
@@ -32,6 +35,7 @@ const POSITIVE_KEYS = [
   'minDwellMs',
   'degradationRatio',
   'optimizeRatio',
+  'stalkProbeDelayMs',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
@@ -41,6 +45,8 @@ const POSITIVE_INTEGER_KEYS = [
   'degradationThreshold',
   'baselineWindow',
   'optimizeThreshold',
+  'stalkSuccessThreshold',
+  'preSwitchMaxProbe',
 ];
 
 function positiveNumber(value, fallback) {

@@ -75,6 +75,9 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     BaselineWindow: String(DEFAULT_CONFIG.baselineWindow),
     OptimizeRatio: String(DEFAULT_CONFIG.optimizeRatio),
     OptimizeThreshold: String(DEFAULT_CONFIG.optimizeThreshold),
+    StalkProbeDelayMs: String(DEFAULT_CONFIG.stalkProbeDelayMs),
+    StalkSuccessThreshold: String(DEFAULT_CONFIG.stalkSuccessThreshold),
+    PreSwitchMaxProbe: String(DEFAULT_CONFIG.preSwitchMaxProbe),
   };
 
   for (const [key, value] of Object.entries(expected)) {
@@ -99,6 +102,9 @@ test('插件源码读取全部双通道配置键', () => {
     'Plugin.ProbeUrls',
     'Plugin.OptimizeRatio',
     'Plugin.OptimizeThreshold',
+    'Plugin.StalkProbeDelayMs',
+    'Plugin.StalkSuccessThreshold',
+    'Plugin.PreSwitchMaxProbe',
   ];
   for (const key of keys) {
     assert.ok(pluginSource.includes(key), `插件源码应读取 ${key}`);

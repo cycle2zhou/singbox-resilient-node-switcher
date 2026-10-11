@@ -38,7 +38,7 @@
 | 通道 A · 快探 | 每 `WatchIntervalMs` | 仅当前节点 `now` | 连续失败或延迟劣化达阈值 → 触发切换三段式 |
 | 通道 B · 候选池 | 每 `PoolRefreshIntervalMs` | 除当前节点与 URLTest 外的全部成员 | 并发受限（`PoolConcurrency`）扫描，产出健康候选池 `candidates` |
 
-切换三段式：候选探测成功 → `PUT /proxies/{selector}` 切换 → 刷新 `/proxies` 确认 `now` 指向目标节点，任一环节失败都记错误、不重试、等下一轮重新判定。切换成功后对被切走节点执行 `markCooldown`（进入冷却，`InitialCooldownMs` 内不重新成为候选），并设最短驻留 `MinDwellMs` 防止乒乓。
+切换三段式：切换前先复核候选（最多 `PreSwitchMaxProbe` 个，跳过不可达者）→ `PUT /proxies/{selector}` 切换 → 刷新 `/proxies` 确认 `now` 指向目标节点，任一环节失败都记错误、不重试、等下一轮重新判定。切换成功后对被切走节点执行 `markCooldown`（进入冷却，`InitialCooldownMs` 内不重新成为候选），并设最短驻留 `MinDwellMs` 防止乒乓；随后进入盯梢期：`StalkProbeDelayMs` 后快探新节点，失败 1 次即快速切走（盯梢期免驻留），连续成功 `StalkSuccessThreshold` 次后退出盯梢、恢复正常阈值。
 
 ## 安装
 
@@ -74,6 +74,9 @@
 | 基线窗口 | `BaselineWindow` | `5` | 延迟基线的采样窗口大小 |
 | 择优倍数 | `OptimizeRatio` | `2` | 当前节点延迟超过候选池最优节点该倍数判为需择优 |
 | 择优连续次数 | `OptimizeThreshold` | `3` | 连续需择优多少次后切换到最优候选 |
+| 盯梢快探延迟(ms) | `StalkProbeDelayMs` | `2000` | 切换成功后多久发起一次盯梢快探验证新节点 |
+| 盯梢成功次数 | `StalkSuccessThreshold` | `2` | 盯梢期内新节点连续成功多少次后退出盯梢恢复正常阈值 |
+| 切换前复核候选数 | `PreSwitchMaxProbe` | `3` | 切换前最多复核多少个候选节点，跳过不可达者 |
 
 ## 状态机
 

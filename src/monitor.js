@@ -52,6 +52,10 @@ export function createMonitor({ api, config, clock, logger }) {
   let watchOptimizeCount = 0;
   let watchCycleCount = 0;
   let poolCycleCount = 0;
+  // 盯梢期：切换后短窗口内快速失败快速切换，待新节点稳定后退出
+  let stalking = false;
+  let stalkingSuccessCount = 0;
+  let stalkTimer = null;
 
   function ensureNodeState(tag) {
     if (!nodeStates.has(tag)) {
@@ -101,6 +105,17 @@ export function createMonitor({ api, config, clock, logger }) {
       }
     }
     return best;
+  }
+
+  // 切换后安排一次立即快探：不等下一轮轮询，尽快确认新节点是否可用。
+  // 仅在真实运行（running）时排定时器，测试手动驱动 watchCycle 时不排，避免定时器泄漏。
+  function scheduleStalkProbe() {
+    if (!running) return;
+    if (stalkTimer) clearTimeout(stalkTimer);
+    stalkTimer = setTimeout(() => {
+      stalkTimer = null;
+      watchCycle().catch((error) => log.error('盯梢快探异常', error?.message || String(error)));
+    }, cfg.stalkProbeDelayMs);
   }
 
   async function runPoolProbe(tag, signal, urls) {
@@ -264,6 +279,8 @@ export function createMonitor({ api, config, clock, logger }) {
         watchFailureCount = 0;
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
+        stalking = false;
+        stalkingSuccessCount = 0;
         currentStartAt = now;
       }
       if (currentStartAt === null) {
@@ -308,6 +325,14 @@ export function createMonitor({ api, config, clock, logger }) {
           watchBaseline = watchBaseline.slice(-cfg.baselineWindow);
         }
         watchFailureCount = 0;
+        if (stalking) {
+          stalkingSuccessCount += 1;
+          if (stalkingSuccessCount >= cfg.stalkSuccessThreshold) {
+            stalking = false;
+            stalkingSuccessCount = 0;
+            log.info('盯梢期结束，新节点稳定');
+          }
+        }
         if (watchBaseline.length >= cfg.baselineWindow && result.delay > median(watchBaseline) * cfg.degradationRatio) {
           watchDegradationCount += 1;
         } else {
@@ -328,10 +353,13 @@ export function createMonitor({ api, config, clock, logger }) {
       }
 
       const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
-      const shouldSwitch = (watchFailureCount >= cfg.failureThreshold)
+      // 盯梢期内：失败 1 次即切、免驻留，尽快摆脱故障节点
+      const effectiveFailureThreshold = stalking ? 1 : cfg.failureThreshold;
+      const effectiveMinDwellMs = stalking ? 0 : cfg.minDwellMs;
+      const shouldSwitch = (watchFailureCount >= effectiveFailureThreshold)
         || (watchDegradationCount >= cfg.degradationThreshold)
         || optimizeTriggered;
-      const dwellSatisfied = now >= (currentStartAt ?? now) + cfg.minDwellMs;
+      const dwellSatisfied = now >= (currentStartAt ?? now) + effectiveMinDwellMs;
 
       if (shouldSwitch && dwellSatisfied) {
         if (candidates.length === 0) {
@@ -340,8 +368,31 @@ export function createMonitor({ api, config, clock, logger }) {
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        const best = bestCandidate();
-        const target = optimizeTriggered && best ? best.tag : candidates[0];
+        // 切换前候选复核：探测候选，跳过当前不可达者，最多尝试 preSwitchMaxProbe 个
+        let target = null;
+        const maxTry = Math.min(cfg.preSwitchMaxProbe, candidates.length);
+        for (let attempt = 0; attempt < maxTry; attempt += 1) {
+          const best = bestCandidate();
+          const candidate = optimizeTriggered && best ? best.tag : candidates[0];
+          const check = await probeAny(
+            candidate,
+            probeUrlSequence(watchCycleCount + attempt),
+            cfg.watchTimeoutMs,
+            cycleController.signal,
+          );
+          if (check.ok) {
+            target = candidate;
+            break;
+          }
+          candidates = candidates.filter((t) => t !== candidate);
+          log.warn(`候选 ${candidate} 复核不可达，跳过`);
+        }
+        if (!target) {
+          lastError = '候选池内候选复核均不可达，等待通道 B 刷新';
+          log.warn(lastError);
+          return { skipped: false, switchedTo: null, error: lastError };
+        }
+
         try {
           await api.select(cfg.selectorName, target, cycleController.signal);
         } catch (error) {
@@ -370,6 +421,9 @@ export function createMonitor({ api, config, clock, logger }) {
           watchFailureCount = 0;
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
+          stalking = true;
+          stalkingSuccessCount = 0;
+          scheduleStalkProbe();
           log.info(`已切换到 ${target}`);
           return { skipped: false, switchedTo: target, error: null };
         }
@@ -409,6 +463,12 @@ export function createMonitor({ api, config, clock, logger }) {
       clearInterval(poolTimer);
       poolTimer = null;
     }
+    if (stalkTimer) {
+      clearTimeout(stalkTimer);
+      stalkTimer = null;
+    }
+    stalking = false;
+    stalkingSuccessCount = 0;
     watchController?.abort();
     watchController = null;
     poolController?.abort();
@@ -437,6 +497,8 @@ export function createMonitor({ api, config, clock, logger }) {
         failureCount: watchFailureCount,
         degradationCount: watchDegradationCount,
         optimizeCount: watchOptimizeCount,
+        stalking,
+        stalkingSuccessCount,
       },
       candidates: [...candidates],
     };

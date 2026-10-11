@@ -525,3 +525,121 @@ test('通道 A 性能择优：当前节点延迟未超阈值时不触发切换',
   assert.equal(monitor.getSnapshot().currentNow, 'n0');
   assert.equal(monitor.getSnapshot().channelA.optimizeCount, 0);
 });
+
+test('切换前候选复核：首个候选不可达时跳过并切到下一个可达候选', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  let n1up = true; // poolCycle 时可达进入候选池，切换前复核时挂掉
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') return { ok: false, reason: 'timeout' };
+      if (node === 'n1') return n1up ? { ok: true, delay: 10 } : { ok: false, reason: 'timeout' };
+      return { ok: true, delay: 10 };
+    },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  // 切换前 n1 挂掉，复核应跳过它
+  n1up = false;
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n2'], '应跳过不可达的 n1 直接切到 n2');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});
+
+test('盯梢期：切换后新节点失败 1 次即快速切走（免驻留）', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  let n1down = false; // 切到 n1 后它才挂掉
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') return { ok: false, reason: 'timeout' };
+      if (node === 'n1') return n1down ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 };
+      return { ok: true, delay: 10 };
+    },
+    select: async (_group, node) => {
+      selected.push(node);
+      currentNow = node;
+      if (node === 'n1') n1down = true;
+      return { ok: true };
+    },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+  assert.deepEqual(selected, ['n1']);
+  assert.equal(monitor.getSnapshot().channelA.stalking, true);
+
+  // 盯梢期 n1 失败 1 次即切（免驻留）
+  await monitor.watchCycle();
+
+  assert.deepEqual(selected, ['n1', 'n2'], '盯梢期新节点失败 1 次应快速切走');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});
+
+test('盯梢期：新节点连续成功 stalkSuccessThreshold 次后退出，恢复正常失败阈值', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  let n1down = false;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') return { ok: false, reason: 'timeout' };
+      if (node === 'n1') return n1down ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 };
+      return { ok: true, delay: 10 };
+    },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+  assert.deepEqual(selected, ['n1']);
+  assert.equal(monitor.getSnapshot().channelA.stalking, true);
+
+  // 盯梢期 n1 成功 2 次 → 退出盯梢
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+  assert.equal(monitor.getSnapshot().channelA.stalking, false, '连续成功 2 次应退出盯梢');
+
+  // 退出盯梢后 n1 失败 1 次：failureThreshold=3，不立即切（candidates 仍有 n2）
+  n1down = true;
+  await monitor.watchCycle();
+  clock.advance(1000);
+  assert.deepEqual(selected, ['n1'], '退出盯梢后失败 1 次不应切换');
+});

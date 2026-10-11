@@ -55,6 +55,9 @@ export default (Plugin) => {
       baselineWindow: Number(Plugin.BaselineWindow),
       optimizeRatio: Number(Plugin.OptimizeRatio),
       optimizeThreshold: Number(Plugin.OptimizeThreshold),
+      stalkProbeDelayMs: Number(Plugin.StalkProbeDelayMs),
+      stalkSuccessThreshold: Number(Plugin.StalkSuccessThreshold),
+      preSwitchMaxProbe: Number(Plugin.PreSwitchMaxProbe),
     };
   }
 
