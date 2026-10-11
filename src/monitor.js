@@ -49,6 +49,7 @@ export function createMonitor({ api, config, clock, logger }) {
   let watchBaseline = [];
   let watchFailureCount = 0;
   let watchDegradationCount = 0;
+  let watchOptimizeCount = 0;
   let watchCycleCount = 0;
   let poolCycleCount = 0;
 
@@ -63,6 +64,18 @@ export function createMonitor({ api, config, clock, logger }) {
     const urls = cfg.probeUrls;
     if (!Array.isArray(urls) || urls.length === 0) return null;
     return urls[cycleCount % urls.length];
+  }
+
+  // 返回候选池中延迟最小的节点 {tag, delay}；候选池为空或全无延迟时返回 null
+  function bestCandidate() {
+    let best = null;
+    for (const tag of candidates) {
+      const st = nodeStates.get(tag);
+      if (st && st.lastDelay != null && (best === null || st.lastDelay < best.delay)) {
+        best = { tag, delay: st.lastDelay };
+      }
+    }
+    return best;
   }
 
   async function runPoolProbe(tag, signal, url) {
@@ -230,6 +243,7 @@ export function createMonitor({ api, config, clock, logger }) {
         watchBaseline = [];
         watchFailureCount = 0;
         watchDegradationCount = 0;
+        watchOptimizeCount = 0;
         currentStartAt = now;
       }
       if (currentStartAt === null) {
@@ -276,12 +290,24 @@ export function createMonitor({ api, config, clock, logger }) {
         } else {
           watchDegradationCount = 0;
         }
+
+        // 性能择优：当前节点延迟明显高于候选池最优时累积计数，连续达标后切到最优节点
+        const best = bestCandidate();
+        if (best && result.delay > best.delay * cfg.optimizeRatio) {
+          watchOptimizeCount += 1;
+        } else {
+          watchOptimizeCount = 0;
+        }
       } else {
         watchFailureCount += 1;
         watchDegradationCount = 0;
+        watchOptimizeCount = 0;
       }
 
-      const shouldSwitch = (watchFailureCount >= cfg.failureThreshold) || (watchDegradationCount >= cfg.degradationThreshold);
+      const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
+      const shouldSwitch = (watchFailureCount >= cfg.failureThreshold)
+        || (watchDegradationCount >= cfg.degradationThreshold)
+        || optimizeTriggered;
       const dwellSatisfied = now >= (currentStartAt ?? now) + cfg.minDwellMs;
 
       if (shouldSwitch && dwellSatisfied) {
@@ -291,7 +317,8 @@ export function createMonitor({ api, config, clock, logger }) {
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        const target = candidates[0];
+        const best = bestCandidate();
+        const target = optimizeTriggered && best ? best.tag : candidates[0];
         try {
           await api.select(cfg.selectorName, target, cycleController.signal);
         } catch (error) {
@@ -319,6 +346,7 @@ export function createMonitor({ api, config, clock, logger }) {
           watchBaseline = [];
           watchFailureCount = 0;
           watchDegradationCount = 0;
+          watchOptimizeCount = 0;
           log.info(`已切换到 ${target}`);
           return { skipped: false, switchedTo: target, error: null };
         }
@@ -385,6 +413,7 @@ export function createMonitor({ api, config, clock, logger }) {
         lastDelay: watchBaseline.length > 0 ? watchBaseline[watchBaseline.length - 1] : null,
         failureCount: watchFailureCount,
         degradationCount: watchDegradationCount,
+        optimizeCount: watchOptimizeCount,
       },
       candidates: [...candidates],
     };

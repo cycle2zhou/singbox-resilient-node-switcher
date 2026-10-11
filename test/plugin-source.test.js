@@ -73,6 +73,8 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     DegradationRatio: String(DEFAULT_CONFIG.degradationRatio),
     DegradationThreshold: String(DEFAULT_CONFIG.degradationThreshold),
     BaselineWindow: String(DEFAULT_CONFIG.baselineWindow),
+    OptimizeRatio: String(DEFAULT_CONFIG.optimizeRatio),
+    OptimizeThreshold: String(DEFAULT_CONFIG.optimizeThreshold),
   };
 
   for (const [key, value] of Object.entries(expected)) {
@@ -95,6 +97,8 @@ test('插件源码读取全部双通道配置键', () => {
     'Plugin.DegradationThreshold',
     'Plugin.BaselineWindow',
     'Plugin.ProbeUrls',
+    'Plugin.OptimizeRatio',
+    'Plugin.OptimizeThreshold',
   ];
   for (const key of keys) {
     assert.ok(pluginSource.includes(key), `插件源码应读取 ${key}`);

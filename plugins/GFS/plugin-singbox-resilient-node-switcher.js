@@ -16,8 +16,8 @@ const DEFAULT_CONFIG = Object.freeze({
   watchIntervalMs: 10000,
   watchTimeoutMs: 4000,
   poolRefreshIntervalMs: 180000,
-  poolTimeoutMs: 5000,
-  poolConcurrency: 20,
+  poolTimeoutMs: 2000,
+  poolConcurrency: 30,
   poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
   recoveryThreshold: 2,
@@ -27,6 +27,8 @@ const DEFAULT_CONFIG = Object.freeze({
   degradationRatio: 3,
   degradationThreshold: 2,
   baselineWindow: 5,
+  optimizeRatio: 2,
+  optimizeThreshold: 3,
 });
 
 const POSITIVE_KEYS = [
@@ -37,6 +39,7 @@ const POSITIVE_KEYS = [
   'initialCooldownMs',
   'minDwellMs',
   'degradationRatio',
+  'optimizeRatio',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
@@ -45,6 +48,7 @@ const POSITIVE_INTEGER_KEYS = [
   'recoveryThreshold',
   'degradationThreshold',
   'baselineWindow',
+  'optimizeThreshold',
 ];
 
 function positiveNumber(value, fallback) {
@@ -316,16 +320,23 @@ function headers(secret, contentType = false) {
 function combineSignal(signal, timeoutMs) {
   const controller = new AbortController();
   let timeout;
+  let timedOut = false;
   const abort = () => controller.abort(signal?.reason);
   if (signal) {
     if (signal.aborted) abort();
     else signal.addEventListener('abort', abort, { once: true });
   }
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-    timeout = setTimeout(() => controller.abort(new DOMException('The operation timed out', 'TimeoutError')), timeoutMs);
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new DOMException('The operation timed out', 'TimeoutError'));
+    }, timeoutMs);
   }
   return {
     signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
     cleanup() {
       clearTimeout(timeout);
       signal?.removeEventListener('abort', abort);
@@ -349,8 +360,8 @@ async function readBody(response) {
   return undefined;
 }
 
-function errorResult(error) {
-  const reason = error?.name === 'TimeoutError' || error?.code === 'UND_ERR_CONNECT_TIMEOUT'
+function errorResult(error, timedOut = false) {
+  const reason = timedOut || error?.name === 'TimeoutError' || error?.code === 'UND_ERR_CONNECT_TIMEOUT'
     ? 'request timeout'
     : (error?.name === 'AbortError' || error?.name === 'CanceledError' ? 'request aborted' : (error?.message || String(error)));
   return { ok: false, status: error?.status, reason };
@@ -373,7 +384,7 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
       }
       return { ok: true, status: response.status, body };
     } catch (error) {
-      return errorResult(error);
+      return errorResult(error, combined.timedOut);
     } finally {
       combined.cleanup();
     }
@@ -456,6 +467,7 @@ function createMonitor({ api, config, clock, logger }) {
   let watchBaseline = [];
   let watchFailureCount = 0;
   let watchDegradationCount = 0;
+  let watchOptimizeCount = 0;
   let watchCycleCount = 0;
   let poolCycleCount = 0;
 
@@ -470,6 +482,18 @@ function createMonitor({ api, config, clock, logger }) {
     const urls = cfg.probeUrls;
     if (!Array.isArray(urls) || urls.length === 0) return null;
     return urls[cycleCount % urls.length];
+  }
+
+  // 返回候选池中延迟最小的节点 {tag, delay}；候选池为空或全无延迟时返回 null
+  function bestCandidate() {
+    let best = null;
+    for (const tag of candidates) {
+      const st = nodeStates.get(tag);
+      if (st && st.lastDelay != null && (best === null || st.lastDelay < best.delay)) {
+        best = { tag, delay: st.lastDelay };
+      }
+    }
+    return best;
   }
 
   async function runPoolProbe(tag, signal, url) {
@@ -637,6 +661,7 @@ function createMonitor({ api, config, clock, logger }) {
         watchBaseline = [];
         watchFailureCount = 0;
         watchDegradationCount = 0;
+        watchOptimizeCount = 0;
         currentStartAt = now;
       }
       if (currentStartAt === null) {
@@ -683,12 +708,24 @@ function createMonitor({ api, config, clock, logger }) {
         } else {
           watchDegradationCount = 0;
         }
+
+        // 性能择优：当前节点延迟明显高于候选池最优时累积计数，连续达标后切到最优节点
+        const best = bestCandidate();
+        if (best && result.delay > best.delay * cfg.optimizeRatio) {
+          watchOptimizeCount += 1;
+        } else {
+          watchOptimizeCount = 0;
+        }
       } else {
         watchFailureCount += 1;
         watchDegradationCount = 0;
+        watchOptimizeCount = 0;
       }
 
-      const shouldSwitch = (watchFailureCount >= cfg.failureThreshold) || (watchDegradationCount >= cfg.degradationThreshold);
+      const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
+      const shouldSwitch = (watchFailureCount >= cfg.failureThreshold)
+        || (watchDegradationCount >= cfg.degradationThreshold)
+        || optimizeTriggered;
       const dwellSatisfied = now >= (currentStartAt ?? now) + cfg.minDwellMs;
 
       if (shouldSwitch && dwellSatisfied) {
@@ -698,7 +735,8 @@ function createMonitor({ api, config, clock, logger }) {
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        const target = candidates[0];
+        const best = bestCandidate();
+        const target = optimizeTriggered && best ? best.tag : candidates[0];
         try {
           await api.select(cfg.selectorName, target, cycleController.signal);
         } catch (error) {
@@ -726,6 +764,7 @@ function createMonitor({ api, config, clock, logger }) {
           watchBaseline = [];
           watchFailureCount = 0;
           watchDegradationCount = 0;
+          watchOptimizeCount = 0;
           log.info(`已切换到 ${target}`);
           return { skipped: false, switchedTo: target, error: null };
         }
@@ -792,6 +831,7 @@ function createMonitor({ api, config, clock, logger }) {
         lastDelay: watchBaseline.length > 0 ? watchBaseline[watchBaseline.length - 1] : null,
         failureCount: watchFailureCount,
         degradationCount: watchDegradationCount,
+        optimizeCount: watchOptimizeCount,
       },
       candidates: [...candidates],
     };
@@ -871,6 +911,8 @@ export default (Plugin) => {
       degradationRatio: Number(Plugin.DegradationRatio),
       degradationThreshold: Number(Plugin.DegradationThreshold),
       baselineWindow: Number(Plugin.BaselineWindow),
+      optimizeRatio: Number(Plugin.OptimizeRatio),
+      optimizeThreshold: Number(Plugin.OptimizeThreshold),
     };
   }
 

@@ -14,16 +14,23 @@ function headers(secret, contentType = false) {
 function combineSignal(signal, timeoutMs) {
   const controller = new AbortController();
   let timeout;
+  let timedOut = false;
   const abort = () => controller.abort(signal?.reason);
   if (signal) {
     if (signal.aborted) abort();
     else signal.addEventListener('abort', abort, { once: true });
   }
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-    timeout = setTimeout(() => controller.abort(new DOMException('The operation timed out', 'TimeoutError')), timeoutMs);
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new DOMException('The operation timed out', 'TimeoutError'));
+    }, timeoutMs);
   }
   return {
     signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
     cleanup() {
       clearTimeout(timeout);
       signal?.removeEventListener('abort', abort);
@@ -47,8 +54,8 @@ async function readBody(response) {
   return undefined;
 }
 
-function errorResult(error) {
-  const reason = error?.name === 'TimeoutError' || error?.code === 'UND_ERR_CONNECT_TIMEOUT'
+function errorResult(error, timedOut = false) {
+  const reason = timedOut || error?.name === 'TimeoutError' || error?.code === 'UND_ERR_CONNECT_TIMEOUT'
     ? 'request timeout'
     : (error?.name === 'AbortError' || error?.name === 'CanceledError' ? 'request aborted' : (error?.message || String(error)));
   return { ok: false, status: error?.status, reason };
@@ -71,7 +78,7 @@ export function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = 
       }
       return { ok: true, status: response.status, body };
     } catch (error) {
-      return errorResult(error);
+      return errorResult(error, combined.timedOut);
     } finally {
       combined.cleanup();
     }

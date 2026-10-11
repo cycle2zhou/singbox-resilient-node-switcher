@@ -42,6 +42,8 @@ test('README 声明默认值与 src/config.js 一致', () => {
     String(DEFAULT_CONFIG.degradationRatio),
     String(DEFAULT_CONFIG.degradationThreshold),
     String(DEFAULT_CONFIG.baselineWindow),
+    String(DEFAULT_CONFIG.optimizeRatio),
+    String(DEFAULT_CONFIG.optimizeThreshold),
   ];
   for (const value of expected) {
     assert.ok(readme.includes(value), `README 应包含默认值 ${value}`);

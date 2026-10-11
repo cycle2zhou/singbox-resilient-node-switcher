@@ -70,19 +70,19 @@
     {
       "id": "ID_pool_timeout_ms",
       "title": "候选池探测超时(ms)",
-      "description": "候选池单节点探测超时，默认 5000",
+      "description": "候选池单节点探测超时，默认 2000",
       "key": "PoolTimeoutMs",
       "component": "Input",
-      "value": "5000",
+      "value": "2000",
       "options": []
     },
     {
       "id": "ID_pool_concurrency",
       "title": "候选池并发",
-      "description": "候选池同批并发探测的最大节点数，默认 20",
+      "description": "候选池同批并发探测的最大节点数，默认 30",
       "key": "PoolConcurrency",
       "component": "Input",
-      "value": "20",
+      "value": "30",
       "options": []
     },
     {
@@ -164,6 +164,24 @@
       "key": "BaselineWindow",
       "component": "Input",
       "value": "5",
+      "options": []
+    },
+    {
+      "id": "ID_optimize_ratio",
+      "title": "性能择优倍数",
+      "description": "当前节点延迟超过候选池最优延迟该倍数时计一次择优，默认 2",
+      "key": "OptimizeRatio",
+      "component": "Input",
+      "value": "2",
+      "options": []
+    },
+    {
+      "id": "ID_optimize_threshold",
+      "title": "择优连续次数",
+      "description": "连续多少次满足择优条件后切换到最快节点，默认 3",
+      "key": "OptimizeThreshold",
+      "component": "Input",
+      "value": "3",
       "options": []
     }
   ]

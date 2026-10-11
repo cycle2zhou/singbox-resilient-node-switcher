@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_CONFIG, normalizeConfig } from '../src/config.js';
 
-test('normalizeConfig({}) 返回规格中的 16 项默认配置', () => {
+test('normalizeConfig({}) 返回规格中的 18 项默认配置', () => {
   const config = normalizeConfig({});
 
   assert.equal(config.selectorName, '🚀 节点选择');
@@ -14,8 +14,8 @@ test('normalizeConfig({}) 返回规格中的 16 项默认配置', () => {
   assert.equal(config.watchIntervalMs, 10000);
   assert.equal(config.watchTimeoutMs, 4000);
   assert.equal(config.poolRefreshIntervalMs, 180000);
-  assert.equal(config.poolTimeoutMs, 5000);
-  assert.equal(config.poolConcurrency, 20);
+  assert.equal(config.poolTimeoutMs, 2000);
+  assert.equal(config.poolConcurrency, 30);
   assert.equal(config.poolFailureRateThreshold, 0.9);
   assert.equal(config.failureThreshold, 3);
   assert.equal(config.recoveryThreshold, 2);
@@ -25,6 +25,8 @@ test('normalizeConfig({}) 返回规格中的 16 项默认配置', () => {
   assert.equal(config.degradationRatio, 3);
   assert.equal(config.degradationThreshold, 2);
   assert.equal(config.baselineWindow, 5);
+  assert.equal(config.optimizeRatio, 2);
+  assert.equal(config.optimizeThreshold, 3);
   assert.deepEqual(config, DEFAULT_CONFIG);
 });
 
@@ -43,6 +45,8 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     degradationRatio: 0,
     degradationThreshold: -1,
     baselineWindow: 0,
+    optimizeRatio: 0,
+    optimizeThreshold: -1,
     poolFailureRateThreshold: -1,
   });
 
@@ -54,6 +58,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     'initialCooldownMs',
     'minDwellMs',
     'degradationRatio',
+    'optimizeRatio',
   ]) {
     assert.ok(config[key] > 0, `${key} 应为正数`);
   }
@@ -64,6 +69,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     'recoveryThreshold',
     'degradationThreshold',
     'baselineWindow',
+    'optimizeThreshold',
   ]) {
     assert.ok(Number.isInteger(config[key]) && config[key] > 0, `${key} 应为正整数`);
   }
@@ -82,6 +88,7 @@ test('并发、阈值和窗口配置只接受正整数', () => {
     'recoveryThreshold',
     'degradationThreshold',
     'baselineWindow',
+    'optimizeThreshold',
   ];
   const invalidValues = [0, -1, 1.5, 0.999, NaN, Infinity, '3'];
 
@@ -100,12 +107,14 @@ test('并发、阈值和窗口配置只接受正整数', () => {
     recoveryThreshold: 7,
     degradationThreshold: 1,
     baselineWindow: 3,
+    optimizeThreshold: 5,
   });
   assert.equal(valid.poolConcurrency, 1);
   assert.equal(valid.failureThreshold, 2);
   assert.equal(valid.recoveryThreshold, 7);
   assert.equal(valid.degradationThreshold, 1);
   assert.equal(valid.baselineWindow, 3);
+  assert.equal(valid.optimizeThreshold, 5);
 });
 
 test('poolFailureRateThreshold 只接受 (0,1] 区间内的有限数字', () => {

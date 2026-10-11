@@ -8,8 +8,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   watchIntervalMs: 10000,
   watchTimeoutMs: 4000,
   poolRefreshIntervalMs: 180000,
-  poolTimeoutMs: 5000,
-  poolConcurrency: 20,
+  poolTimeoutMs: 2000,
+  poolConcurrency: 30,
   poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
   recoveryThreshold: 2,
@@ -19,6 +19,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   degradationRatio: 3,
   degradationThreshold: 2,
   baselineWindow: 5,
+  optimizeRatio: 2,
+  optimizeThreshold: 3,
 });
 
 const POSITIVE_KEYS = [
@@ -29,6 +31,7 @@ const POSITIVE_KEYS = [
   'initialCooldownMs',
   'minDwellMs',
   'degradationRatio',
+  'optimizeRatio',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
@@ -37,6 +40,7 @@ const POSITIVE_INTEGER_KEYS = [
   'recoveryThreshold',
   'degradationThreshold',
   'baselineWindow',
+  'optimizeThreshold',
 ];
 
 function positiveNumber(value, fallback) {

@@ -53,6 +53,8 @@ export default (Plugin) => {
       degradationRatio: Number(Plugin.DegradationRatio),
       degradationThreshold: Number(Plugin.DegradationThreshold),
       baselineWindow: Number(Plugin.BaselineWindow),
+      optimizeRatio: Number(Plugin.OptimizeRatio),
+      optimizeThreshold: Number(Plugin.OptimizeThreshold),
     };
   }
 

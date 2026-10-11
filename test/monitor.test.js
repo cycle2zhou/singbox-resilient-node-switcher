@@ -446,3 +446,59 @@ test('stop 时进行中的 poolCycle 不抛 null 异常', async () => {
   await cycle;
   assert.equal(monitor.getSnapshot().poolInProgress, false);
 });
+
+test('通道 A 性能择优：当前节点延迟明显高于候选池最优时连续达标后切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n0' ? { ok: true, delay: 100 } : { ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  // optimizeRatio=2、optimizeThreshold=3：100 > 10*2，连续 3 次达标触发切换
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1']);
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+  assert.equal(monitor.getSnapshot().channelA.optimizeCount, 0, '切换后择优计数应重置');
+});
+
+test('通道 A 性能择优：当前节点延迟未超阈值时不触发切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n0' ? { ok: true, delay: 15 } : { ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  // 15 <= 10*2=20，不触发择优，多次探测仍不切换
+  for (let i = 0; i < 5; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, [], '延迟未超阈值不应触发择优切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n0');
+  assert.equal(monitor.getSnapshot().channelA.optimizeCount, 0);
+});

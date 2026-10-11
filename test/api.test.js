@@ -149,3 +149,20 @@ test('probe 超时归类为 request timeout，非 request aborted', async () => 
   assert.match(result.reason, /timeout/i);
   assert.doesNotMatch(result.reason, /abort/i);
 });
+
+test('真实 fetch 超时抛 AbortError 时仍归类为 request timeout', async () => {
+  // 真实 fetch（如 GFS 运行环境）在 abort 后抛 name='AbortError' 的错误，
+  // 而非 signal.reason。依赖 timedOut 标志才能正确区分超时与外部中断。
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        reject(new DOMException('The operation was aborted', 'AbortError'));
+      });
+    }),
+  });
+  const result = await api.probe('node', 'https://example.test', 1);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /timeout/i);
+  assert.doesNotMatch(result.reason, /abort/i);
+});
