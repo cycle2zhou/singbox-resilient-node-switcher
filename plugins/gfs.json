@@ -1,6 +1,6 @@
 {
   "id": "plugin-singbox-resilient-node-switcher",
-  "version": "v0.1.0",
+  "version": "v1.0.0",
   "name": "节点弹性切换",
   "group": "Extensions",
   "description": "面向 GUI.for.SingBox 的 Selector 健康监控与可恢复故障切换：主动探测节点延迟，连续失败后暂时冷却故障节点，冷却到期半开验证，恢复后重新参与选择；仅在验证候选成功后才切换，不永久剔除节点。",
@@ -8,6 +8,7 @@
   "type": "Http",
   "url": "https://raw.githubusercontent.com/GUI-for-Cores/Plugin-Hub/main/plugins/GFS/plugin-singbox-resilient-node-switcher.js",
   "path": "data/plugins/plugin-singbox-resilient-node-switcher.js",
+  "status": 0,
   "triggers": ["on::manual", "on::core::started", "on::core::stopped", "on::shutdown"],
   "hasUI": true,
   "menus": {
@@ -274,5 +275,8 @@
       "value": "1",
       "options": []
     }
-  ]
+  ],
+  "disabled": false,
+  "install": false,
+  "installed": false
 }
