@@ -26,7 +26,8 @@
    误归类为「request aborted」而非「request timeout」。真实采样 108 次 aborted 实为超时。
 3. **type:File 安装丢元数据**：用户以文件方式导入后，GFS 注册仅 `triggers:[on::manual]`、
    `configuration:[]`、`hasUI:false`、`menus:{}`，核心重启不自动启动、无法改配置。
-4. **probeUrl 默认 gstatic.com 在国内不稳**：易导致大量节点被误判为超时。
+4. **单一探测 URL（gstatic.com）是国内不稳的单点故障**：被墙/DNS 污染时大量节点被误判为超时，
+   且全池失败无法区分「节点故障」与「探测目标/API 故障」。
 
 用户明确要求「从根本设计上解决，不能暂时混过去」，因此本设计重构探测节奏与职责拆分，而非微调参数。
 
@@ -82,17 +83,18 @@
 ### 7.1 通道 A · 当前节点快探
 
 1. `getProxies` 读 `selector.now`，确认无外部改动（有改动则接受新选择、重置窗口，不切回）。
-2. 只探测 `now`（超时 `watchTimeoutMs`）。
+2. 只探测 `now`（超时 `watchTimeoutMs`），探测 URL 按轮次轮换（`probeUrls[watchCycleCount % probeUrls.length]`）。
 3. 成功 → 推进滑动基线（最近 `baselineWindow` 次）；失败 → `failureCount++`。
 4. 判定，任一命中即触发切换：
-   - **故障**：连续失败 ≥ `failureThreshold`
+   - **故障**：连续失败 ≥ `failureThreshold`（连续多轮轮换不同 URL，天然要求多个 URL 都失败才判故障，单 URL 抖动最多 1 次失败）
    - **延迟劣化**：基线满后，实时延迟 > 基线中位数 × `degradationRatio`，连续 `degradationThreshold` 次
 
 ### 7.2 通道 B · 候选池后台刷新
 
 1. `getProxies` 读成员列表（跳过当前 now、跳过 URLTest）。
-2. 以 `poolConcurrency` 并发探测全部叶子，每节点走完整状态机。
-3. 产出 `candidates` = 状态 healthy 且 `lastDelay != null` 且 `lastError == null` 的节点列表（按 `getProxies` 返回的成员顺序排列），缓存起来。
+2. 以 `poolConcurrency` 并发探测全部叶子，每节点走完整状态机；本轮统一使用一个探测 URL（按轮次轮换）。
+3. **全池失败熔断**：统计本轮实际探测节点的失败率，若失败率 > `poolFailureRateThreshold`，判定为「探测目标/API 故障」而非「节点故障」，本轮结果作废（不推进任何节点状态、保持上一轮 `nodeStates`），记 `lastError` 与 warn。
+4. 产出 `candidates` = 状态 healthy 且 `lastDelay != null` 且 `lastError == null` 的节点列表（按 `getProxies` 返回的成员顺序排列），缓存起来。
 
 ### 7.3 切换三段式（通道 A 命中后）
 
@@ -105,12 +107,13 @@
 | 配置键 | 默认值 | 说明 |
 |--------|--------|------|
 | `selectorName` | `'🚀 节点选择'` | 主 Selector 名（保留）|
-| `probeUrl` | `'https://www.gstatic.com/generate_204'` | 探测 URL（保留）|
+| `probeUrls` | `['https://www.gstatic.com/generate_204','https://cp.cloudflare.com/generate_204','https://www.google.com/generate_204']` | 探测 URL 列表，按轮次轮询（原 `probeUrl` 改为列表）|
 | `watchIntervalMs` | `10000` | 通道 A 快探间隔（原 `intervalMs:30000` 拆出）|
 | `watchTimeoutMs` | `4000` | 快探超时（原 `timeoutMs:5000`）|
 | `poolRefreshIntervalMs` | `180000` | 通道 B 候选池刷新间隔（原 `intervalMs` 拆出）|
 | `poolTimeoutMs` | `5000` | 候选池探测超时 |
 | `poolConcurrency` | `20` | 候选池并发（原 `concurrency:3`）|
+| `poolFailureRateThreshold` | `0.9` | 全池失败熔断阈值（本轮失败率超过则作废）|
 | `failureThreshold` | `3` | 连续失败判故障（保留）|
 | `recoveryThreshold` | `2` | half-open 恢复阈值（保留）|
 | `initialCooldownMs` | `120000` | 初始冷却（保留）|
@@ -122,7 +125,7 @@
 
 改动落点：`src/config.js`（`DEFAULT_CONFIG` + `normalizeConfig` 新键校验）、
 `scripts/plugin-adapter.js`（`buildConfig()` 改读 `Plugin.WatchIntervalMs` 等新键）、
-`plugins/gfs.json`（`configuration` 重写为 15 项）。
+`plugins/gfs.json`（`configuration` 重写为 16 项）。
 
 ## 9. 错误处理与边界情况
 
@@ -135,7 +138,8 @@
 6. **延迟基线不足**：基线未满时禁用延迟劣化判定，只走故障判定。
 7. **停止竞态**：`stop()` 用局部 `AbortController`，`abort()` 后置空；`runCycle` 后续批次不得解引用已置空 controller
    （守住 `dcd4898` 已修过的 null 解引用，需回归测试覆盖）。
-8. **探测 URL 不稳定**：单节点一次超时/非 2xx 只记失败，连续失败阈值天然隔离偶发抖动，不因 URL 本身问题误切。
+8. **探测 URL 不稳定**：改用 `probeUrls` 列表按轮次轮询，单 URL 抖动最多影响一轮快探；候选池整轮失败率超过
+   `poolFailureRateThreshold` 时全池熔断，本轮作废不推进状态，避免探测目标故障污染节点状态机。
 
 ## 10. 可观测性 UI 落地
 
@@ -161,5 +165,5 @@
 - `test/monitor.test.js`：重写为双通道语义（快探判定 + 候选池刷新 + 三段式确认）。
 - `test/api.test.js`：补一层超时后的错误分类断言。
 - `test/config.test.js`：新配置键默认值与校验。
-- `test/plugin-source.test.js`、`test/integration-contract.test.js`：expected 表更新为 15 键 + 新触发器断言。
+- `test/plugin-source.test.js`、`test/integration-contract.test.js`：expected 表更新为 16 键 + 新触发器断言。
 - `README.md`：配置表、状态机说明、限制说明更新。
