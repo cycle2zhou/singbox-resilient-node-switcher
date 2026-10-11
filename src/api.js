@@ -33,7 +33,13 @@ function combineSignal(signal, timeoutMs) {
 
 async function readBody(response) {
   const contentType = response.headers?.get?.('content-type') ?? '';
-  if (contentType.includes('json') && typeof response.json === 'function') return response.json();
+  if (contentType.includes('json') && typeof response.json === 'function') {
+    try {
+      return await response.json();
+    } catch {
+      throw new Error('response body is not valid JSON');
+    }
+  }
   if (typeof response.text === 'function') {
     const text = await response.text();
     try { return JSON.parse(text); } catch { return text; }
@@ -45,21 +51,29 @@ function errorResult(error) {
   const reason = error?.name === 'TimeoutError' || error?.code === 'UND_ERR_CONNECT_TIMEOUT'
     ? 'request timeout'
     : (error?.name === 'AbortError' || error?.name === 'CanceledError' ? 'request aborted' : (error?.message || String(error)));
-  return { ok: false, reason };
+  return { ok: false, status: error?.status, reason };
 }
 
-export function createClashApi({ baseUrl, secret, fetchImpl = globalThis.fetch }) {
+export function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalThis.fetch }) {
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
-  const request = async (path, options = {}, signal) => {
+  const request = async (path, options = {}, signal, requestTimeoutMs = timeoutMs) => {
+    const combined = combineSignal(signal, requestTimeoutMs);
     try {
-      const response = await fetchImpl(joinUrl(baseUrl, path), { ...options, signal, headers: { ...headers(secret), ...options.headers } });
-      const body = await readBody(response);
+      const response = await fetchImpl(joinUrl(baseUrl, path), { ...options, signal: combined.signal, headers: { ...headers(secret), ...options.headers } });
+      let body;
+      try {
+        body = await readBody(response);
+      } catch (error) {
+        return { ok: false, status: response.status, reason: error.message };
+      }
       if (!response.ok && (response.status < 200 || response.status >= 300)) {
         return { ok: false, status: response.status, reason: `request failed with HTTP ${response.status}`, body };
       }
       return { ok: true, status: response.status, body };
     } catch (error) {
       return errorResult(error);
+    } finally {
+      combined.cleanup();
     }
   };
 
@@ -91,7 +105,7 @@ export function createClashApi({ baseUrl, secret, fetchImpl = globalThis.fetch }
           headers: headers(secret, true),
           body: JSON.stringify({ name: node }),
         }, combined.signal);
-        if (!result.ok) return result;
+        if (!result.ok) throw Object.assign(new Error(result.reason), result);
         return { ok: true, status: result.status, body: result.body };
       } finally {
         combined.cleanup();

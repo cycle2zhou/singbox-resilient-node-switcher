@@ -48,7 +48,58 @@ test('probe URL-encodes node, passes query, and validates delay', async () => {
   assert.equal(calls[0].options.headers.Authorization, 'Bearer s');
 });
 
-test('probe rejects non-2xx and timeout errors', async () => {
+test('getProxies uses default timeout and throws request errors with status/reason', async () => {
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    timeoutMs: 1,
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason));
+    }),
+  });
+
+  await assert.rejects(api.getProxies(), (error) => {
+    assert.equal(error.ok, false);
+    assert.equal(error.status, undefined);
+    assert.match(error.reason, /timeout/i);
+    return true;
+  });
+});
+
+test('select uses default timeout and throws request errors', async () => {
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    timeoutMs: 1,
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason));
+    }),
+  });
+
+  await assert.rejects(api.select('group', 'node'), (error) => {
+    assert.equal(error.ok, false);
+    assert.match(error.reason, /timeout/i);
+    return true;
+  });
+});
+
+test('getProxies reports invalid JSON with an explicit reason', async () => {
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    fetchImpl: async () => ({
+      status: 200,
+      ok: true,
+      headers: { get: () => 'application/json' },
+      async json() { throw new SyntaxError('Unexpected token'); },
+    }),
+  });
+
+  await assert.rejects(api.getProxies(), (error) => {
+    assert.equal(error.status, 200);
+    assert.match(error.reason, /not valid JSON/i);
+    return true;
+  });
+});
+
+test('probe rejects non-2xx and timeout errors', async () => { 
   const api = createClashApi({
     baseUrl: 'http://localhost:9090',
     fetchImpl: async () => response(503, { error: 'unavailable' }),
