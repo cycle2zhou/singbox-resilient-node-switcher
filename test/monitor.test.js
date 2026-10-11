@@ -49,7 +49,7 @@ function makeApi(overrides = {}) {
 
 const fastConfig = { ...DEFAULT_CONFIG, minDwellMs: 1 };
 
-test('同步主 Selector 的 all/now，嵌套 URLTest 不展开内部节点', async () => {
+test('通道 B 同步成员、跳过 URLTest 与当前 now、按成员顺序产出 candidates', async () => {
   const proxies = selectorProxy('node-a', ['node-a', 'node-b', '🎈 自动选择'], {
     'node-a': { type: 'Shadowsocks' },
     'node-b': { type: 'Shadowsocks' },
@@ -58,33 +58,29 @@ test('同步主 Selector 的 all/now，嵌套 URLTest 不展开内部节点', as
     'inner-2': { type: 'Shadowsocks' },
   });
 
-  const api = makeApi({ getProxies: async () => ({ proxies }) });
-  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  const probed = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async (node) => {
+      probed.push(node);
+      return node === 'node-b' ? { ok: true, delay: 10 } : { ok: false, reason: 'timeout' };
+    },
+  });
 
-  await monitor.runCycle();
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle();
 
   const snap = monitor.getSnapshot();
   assert.equal(snap.currentNow, 'node-a');
   assert.deepEqual([...snap.members].sort(), ['node-a', 'node-b', '🎈 自动选择']);
   assert.equal(snap.memberTypes['🎈 自动选择'], 'URLTest');
   assert.equal(snap.memberTypes['inner-1'], undefined);
+  // 只探测 node-b（跳过当前 now node-a 与 URLTest），candidates 按成员顺序
+  assert.deepEqual(probed, ['node-b']);
+  assert.deepEqual(snap.candidates, ['node-b']);
 });
 
-test('主 Selector 缺失、类型非 Selector 或空成员时停止切换并报告原因', async () => {
-  const missing = makeApi({ getProxies: async () => ({ proxies: {} }) });
-  const m1 = createMonitor({ api: missing, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
-  await m1.runCycle();
-  assert.match(m1.getSnapshot().lastError, /不存在|not found|不存在/i);
-
-  const urlTestGroup = makeApi({
-    getProxies: async () => ({ proxies: { [SELECTOR]: { type: 'URLTest', now: 'x', all: ['x'] } } }),
-  });
-  const m2 = createMonitor({ api: urlTestGroup, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
-  await m2.runCycle();
-  assert.match(m2.getSnapshot().lastError, /非 Selector|Selector|not a Selector/i);
-});
-
-test('轮次探测并发不超过上限', async () => {
+test('通道 B 并发峰值不超过 poolConcurrency 且跳过当前 now', async () => {
   const tags = Array.from({ length: 9 }, (_, i) => `n${i}`);
   const proxies = selectorProxy('n0', tags, leafTypes(tags));
 
@@ -104,36 +100,27 @@ test('轮次探测并发不超过上限', async () => {
   });
 
   const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
-  await monitor.runCycle();
+  await monitor.poolCycle();
 
-  assert.ok(maxActive <= fastConfig.concurrency, `并发峰值 ${maxActive} 应不超过 ${fastConfig.concurrency}`);
-  assert.equal(probeCount, tags.length);
+  assert.ok(maxActive <= fastConfig.poolConcurrency, `并发峰值 ${maxActive} 应不超过 ${fastConfig.poolConcurrency}`);
+  assert.equal(probeCount, tags.length - 1);
 });
 
-test('上一轮未完成时第二次 runCycle 被跳过', async () => {
-  const tags = ['n0', 'n1', 'n2', 'n3', 'n4', 'n5'];
-  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+test('主 Selector 缺失、类型非 Selector 或空成员时停止并报告原因', async () => {
+  const missing = makeApi({ getProxies: async () => ({ proxies: {} }) });
+  const m1 = createMonitor({ api: missing, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await m1.poolCycle();
+  assert.match(m1.getSnapshot().lastError, /不存在|not found/i);
 
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  const api = makeApi({
-    getProxies: async () => ({ proxies }),
-    probe: async () => { await gate; return { ok: true, delay: 1 }; },
+  const urlTestGroup = makeApi({
+    getProxies: async () => ({ proxies: { [SELECTOR]: { type: 'URLTest', now: 'x', all: ['x'] } } }),
   });
-
-  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
-
-  const first = monitor.runCycle();
-  await new Promise((r) => setTimeout(r, 5));
-  const second = await monitor.runCycle(); // 应立即跳过
-
-  assert.equal(second.skipped, true);
-
-  release();
-  await first;
+  const m2 = createMonitor({ api: urlTestGroup, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await m2.poolCycle();
+  assert.match(m2.getSnapshot().lastError, /非 Selector|Selector/i);
 });
 
-test('当前节点达到失败阈值后仅切换到已探测成功且非冷却的候选', async () => {
+test('通道 A 只探当前 now，连续失败达到 failureThreshold 后从 candidates 切换', async () => {
   let currentNow = 'n0';
   const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
 
@@ -147,18 +134,204 @@ test('当前节点达到失败阈值后仅切换到已探测成功且非冷却�
   const clock = makeClock(0);
   const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
 
-  // 三轮让 n0 与 n2 累积到失败阈值
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
   for (let i = 0; i < 3; i += 1) {
-    await monitor.runCycle();
+    await monitor.watchCycle();
     clock.advance(1000);
   }
 
   assert.deepEqual(selected, ['n1']);
   const snap = monitor.getSnapshot();
   assert.equal(snap.currentNow, 'n1');
+  assert.equal(snap.nodeStates['n0'].status, 'cooldown');
 });
 
-test('发现外部 now 变化时接受新选择并重置失败窗口，不切回旧节点', async () => {
+test('通道 A 延迟劣化：基线满后实时延迟>中位数×ratio 连续 2 次触发切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const delays = [10, 10, 10, 10, 10, 100, 100];
+  let probeIdx = 0;
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') {
+        const d = delays[probeIdx] ?? delays[delays.length - 1];
+        probeIdx += 1;
+        return { ok: true, delay: d };
+      }
+      return { ok: true, delay: 10 };
+    },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  for (let i = 0; i < 7; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1']);
+});
+
+test('延迟基线不足时禁用劣化判定，只走故障判定', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  let n0probe = 0;
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') {
+        n0probe += 1;
+        return n0probe <= 2 ? { ok: true, delay: 100 } : { ok: false, reason: 'timeout' };
+      }
+      return { ok: true, delay: 10 };
+    },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  // 前 2 次成功 delay=100（基线 < baselineWindow=5），不触发劣化切换
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+  assert.equal(selected.length, 0, '基线不足时延迟劣化不触发切换');
+
+  // 之后连续失败 3 次才切换
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+  assert.deepEqual(selected, ['n1']);
+});
+
+test('候选池为空时不切换并记 lastError', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: false, reason: 'timeout' }),
+    select: async () => ({ ok: true }),
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, []);
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.currentNow, 'n0');
+  assert.match(snap.lastError, /候选池为空/);
+});
+
+test('通道 B 全池失败率超过阈值时本轮作废、不推进状态', async () => {
+  const tags = ['n0', 'n1', 'n2', 'n3'];
+  const proxies = () => selectorProxy('n0', tags, leafTypes(tags));
+
+  let failAll = false;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => (failAll ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 }),
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+
+  await monitor.poolCycle();
+  const snap1 = monitor.getSnapshot();
+  assert.deepEqual(snap1.candidates, ['n1', 'n2', 'n3']);
+  assert.equal(snap1.nodeStates['n1'].status, 'healthy');
+
+  failAll = true;
+  await monitor.poolCycle();
+
+  const snap2 = monitor.getSnapshot();
+  assert.equal(snap2.nodeStates['n1'].status, 'healthy');
+  assert.equal(snap2.nodeStates['n1'].lastError, null);
+  assert.deepEqual(snap2.candidates, ['n1', 'n2', 'n3']);
+  assert.match(snap2.lastError, /熔断|全池|失败率/);
+});
+
+test('通道 A 快探按轮次轮换 probeUrls', async () => {
+  const proxies = () => selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const probedUrls = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node, url) => {
+      if (node === 'n0') probedUrls.push(url);
+      return { ok: true, delay: 1 };
+    },
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+  }
+
+  assert.deepEqual(probedUrls, [
+    DEFAULT_CONFIG.probeUrls[0],
+    DEFAULT_CONFIG.probeUrls[1],
+    DEFAULT_CONFIG.probeUrls[2],
+  ]);
+});
+
+test('切换后驻留期 minDwellMs 内不二次切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === currentNow ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: { ...fastConfig, minDwellMs: 5000 }, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  // 每次 advance 3000，第 3 次 now=6000 >= 0+5000 触发首次切换（currentStartAt=6000）
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(3000);
+  }
+  assert.deepEqual(selected, ['n1']);
+
+  // 切换后 clock 不前进（now 停在 9000 < 6000+5000=11000），即使当前节点失败也不二次切换
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+  }
+
+  assert.deepEqual(selected, ['n1'], '驻留期内不应二次切换');
+});
+
+test('外部 now 变化接受新选择、重置快探窗口、不切回', async () => {
   let currentNow = 'n0';
   const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
 
@@ -172,18 +345,21 @@ test('发现外部 now 变化时接受新选择并重置失败窗口，不切回
   const clock = makeClock(0);
   const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
 
-  await monitor.runCycle(); // n0 与 n1 均失败一次，各自 suspect fc=1
+  await monitor.watchCycle();
+  clock.advance(1000);
+  await monitor.watchCycle();
   clock.advance(1000);
 
-  // 用户手动切换到 n1
-  currentNow = 'n1';
-  await monitor.runCycle();
+  let snap = monitor.getSnapshot();
+  assert.equal(snap.channelA.failureCount, 2);
 
+  currentNow = 'n1';
+  await monitor.watchCycle();
+
+  snap = monitor.getSnapshot();
   assert.equal(selects, 0, '外部变化后不应切回旧节点');
-  const snap = monitor.getSnapshot();
   assert.equal(snap.currentNow, 'n1');
-  // 重置后 n1 从 0 开始重新累积，本应累加到 2 却只到 1
-  assert.equal(snap.nodeStates['n1'].failureCount, 1, '新选择节点失败窗口应从零重新累积');
+  assert.equal(snap.channelA.failureCount, 1, '新选择节点失败窗口应从零重新累积');
 });
 
 test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', async () => {
@@ -193,15 +369,18 @@ test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', as
   const api = makeApi({
     getProxies: async () => ({ proxies: proxies() }),
     probe: async (node) => (node === 'n1' ? { ok: true, delay: 5 } : { ok: false, reason: 'timeout' }),
-    select: async () => ({ ok: true }), // PUT 成功但不改变 now
+    select: async () => ({ ok: true }),
   });
 
   const clock = makeClock(0);
   const logger = makeLogger();
   const monitor = createMonitor({ api, config: fastConfig, clock, logger });
 
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
   for (let i = 0; i < 3; i += 1) {
-    await monitor.runCycle();
+    await monitor.watchCycle();
     clock.advance(1000);
   }
 
@@ -212,33 +391,28 @@ test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', as
   );
 });
 
-test('探测进行中调用 stop 不抛 null 异常（controller 已被置空仍安全）', async () => {
+test('stop 时进行中的 poolCycle 不抛 null 异常', async () => {
   const tags = ['n0', 'n1', 'n2'];
   const proxies = selectorProxy('n0', tags, leafTypes(tags));
 
-  let releaseN0;
+  let release;
   const api = makeApi({
     getProxies: async () => ({ proxies }),
     probe: async (tag) => {
-      if (tag === 'n0') {
-        return new Promise((resolve) => { releaseN0 = resolve; });
+      if (tag === 'n1') {
+        return new Promise((resolve) => { release = resolve; });
       }
       return { ok: false, reason: 'timeout' };
     },
   });
 
-  const monitor = createMonitor({
-    api,
-    config: { ...fastConfig, concurrency: 1 },
-    clock: makeClock(0),
-    logger: makeLogger(),
-  });
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
 
-  const cycle = monitor.runCycle();
-  await new Promise((r) => setTimeout(r, 10)); // 进入 n0 的挂起探测
-  monitor.stop(); // 此时 controller 被置空，进行中的轮次不应崩溃
-  releaseN0({ ok: true, delay: 50 }); // 释放 n0，轮次继续探测 n1/n2
+  const cycle = monitor.poolCycle();
+  await new Promise((r) => setTimeout(r, 10));
+  monitor.stop();
+  release({ ok: true, delay: 50 });
 
-  await cycle; // 修复前会因 null.signal 抛异常；修复后应正常完成
-  assert.equal(monitor.getSnapshot().cycleInProgress, false);
+  await cycle;
+  assert.equal(monitor.getSnapshot().poolInProgress, false);
 });
