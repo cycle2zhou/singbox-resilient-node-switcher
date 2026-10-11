@@ -56,7 +56,9 @@ node --test
 
 提交信息：`feat: add sing-box clash api client`
 
-提交哈希：`8196a61`（最终提交哈希以修订提交后的 `git rev-parse --short HEAD` 为准）。
+Task 2 实现提交哈希：`0f35865`。
+
+本报告在实现提交之后单独补交，以避免报告内容中的哈希改变实现提交本身。
 
 ## 顾虑
 
