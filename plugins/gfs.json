@@ -59,6 +59,15 @@
       "options": []
     },
     {
+      "id": "ID_max_delay_ms",
+      "title": "绝对延迟阈值(ms)",
+      "description": "探测成功但延迟超过该值即计「慢」，连续慢达标触发切换，默认 2000",
+      "key": "MaxDelayMs",
+      "component": "Input",
+      "value": "2000",
+      "options": []
+    },
+    {
       "id": "ID_pool_refresh_interval_ms",
       "title": "候选池刷新间隔(ms)",
       "description": "候选池后台刷新的间隔，默认 180000",
@@ -153,6 +162,15 @@
       "title": "劣化连续次数",
       "description": "连续劣化多少次后触发切换，默认 2",
       "key": "DegradationThreshold",
+      "component": "Input",
+      "value": "2",
+      "options": []
+    },
+    {
+      "id": "ID_slow_threshold",
+      "title": "慢节点连续次数",
+      "description": "连续多少次超过绝对延迟阈值后触发切换，默认 2",
+      "key": "SlowThreshold",
       "component": "Input",
       "value": "2",
       "options": []

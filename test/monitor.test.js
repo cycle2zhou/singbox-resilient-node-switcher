@@ -643,3 +643,119 @@ test('盯梢期：新节点连续成功 stalkSuccessThreshold 次后退出，恢
   clock.advance(1000);
   assert.deepEqual(selected, ['n1'], '退出盯梢后失败 1 次不应切换');
 });
+
+test('通道 A 绝对慢判定：延迟超过 maxDelayMs 连续 slowThreshold 次触发切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n0' ? { ok: true, delay: 2500 } : { ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1']);
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+});
+
+test('tag 漂移：切换前后按 stableKey 剔除新旧节点，确认用 stableKey 比较', async () => {
+  // 当前节点带后缀，候选池里残留旧节点 n0 的旧后缀快照（tag 漂移）
+  let currentNow = 'n0 | 3ms';
+  const proxies = () => selectorProxy(
+    currentNow,
+    ['n0 | 3ms', 'n0 | 5ms', 'n1', 'n2'],
+    leafTypes(['n0 | 3ms', 'n0 | 5ms', 'n1', 'n2']),
+  );
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n0 | 3ms' ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 }),
+    select: async (_group, node) => {
+      selected.push(node);
+      currentNow = `${node} | 8ms`; // 切换后 GFS 又改后缀
+      return { ok: true };
+    },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  // poolCycle 精确匹配只排除 'n0 | 3ms'，'n0 | 5ms'（旧后缀快照）仍被探测并进入候选
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n0 | 5ms', 'n1', 'n2']);
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  // 候选复核前应排除 stableKey 等于当前节点的 'n0 | 5ms'，切到 n1
+  assert.deepEqual(selected, ['n1']);
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+  // 切换成功后按 stableKey 剔除新节点 n1 与旧节点 n0 系列，只剩 n2
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n2']);
+});
+
+test('切换 API 失败时记 lastError 并重置 failureCount，避免累积卡死', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n0' ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 }),
+    select: async () => { throw new Error('API 不可用'); },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  const snap = monitor.getSnapshot();
+  assert.match(snap.lastError, /switch failed/);
+  assert.equal(snap.channelA.failureCount, 0, '切换失败后 failureCount 应重置');
+});
+
+test('切换确认失败时记 lastError 并重置 failureCount', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n0' ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 }),
+    select: async () => ({ ok: true }), // 控制面未生效，now 仍为 n0
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  const snap = monitor.getSnapshot();
+  assert.match(snap.lastError, /switch confirm failed/);
+  assert.equal(snap.channelA.failureCount, 0, '切换确认失败后 failureCount 应重置');
+});

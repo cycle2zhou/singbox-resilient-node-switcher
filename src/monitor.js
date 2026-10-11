@@ -23,6 +23,15 @@ function median(arr) {
   return (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+// GFS 实时测速会改写节点名（追加「 | IP | 延迟ms | 速度mb/s [...]_序号_序号」后缀），
+// 同一节点的 tag 在不同时刻后缀不同，导致精确匹配失效（切换确认失败、剔除旧节点失效）。
+// stableKey 截断「| 延迟ms」及之后的可变后缀，保留到 IP，得到稳定身份用于比较。
+function stableKey(tag) {
+  if (typeof tag !== 'string') return tag;
+  const m = tag.match(/^(.*?)\s*\|\s*\d+(?:\.\d+)?ms\b/);
+  return m ? m[1].trim() : tag;
+}
+
 export function createMonitor({ api, config, clock, logger }) {
   const cfg = normalizeConfig(config);
   const time = clock && typeof clock.now === 'function' ? clock : Date;
@@ -50,6 +59,7 @@ export function createMonitor({ api, config, clock, logger }) {
   let watchFailureCount = 0;
   let watchDegradationCount = 0;
   let watchOptimizeCount = 0;
+  let watchSlowCount = 0;
   let watchCycleCount = 0;
   let poolCycleCount = 0;
   // 盯梢期：切换后短窗口内快速失败快速切换，待新节点稳定后退出
@@ -279,6 +289,7 @@ export function createMonitor({ api, config, clock, logger }) {
         watchFailureCount = 0;
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
+        watchSlowCount = 0;
         stalking = false;
         stalkingSuccessCount = 0;
         currentStartAt = now;
@@ -338,6 +349,12 @@ export function createMonitor({ api, config, clock, logger }) {
         } else {
           watchDegradationCount = 0;
         }
+        // 绝对慢判定：探测成功但延迟超过 maxDelayMs 即计「慢」，连续达标触发切换
+        if (result.delay > cfg.maxDelayMs) {
+          watchSlowCount += 1;
+        } else {
+          watchSlowCount = 0;
+        }
 
         // 性能择优：当前节点延迟明显高于候选池最优时累积计数，连续达标后切到最优节点
         const best = bestCandidate();
@@ -350,6 +367,7 @@ export function createMonitor({ api, config, clock, logger }) {
         watchFailureCount += 1;
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
+        watchSlowCount = 0;
       }
 
       const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
@@ -358,6 +376,7 @@ export function createMonitor({ api, config, clock, logger }) {
       const effectiveMinDwellMs = stalking ? 0 : cfg.minDwellMs;
       const shouldSwitch = (watchFailureCount >= effectiveFailureThreshold)
         || (watchDegradationCount >= cfg.degradationThreshold)
+        || (watchSlowCount >= cfg.slowThreshold)
         || optimizeTriggered;
       const dwellSatisfied = now >= (currentStartAt ?? now) + effectiveMinDwellMs;
 
@@ -370,6 +389,8 @@ export function createMonitor({ api, config, clock, logger }) {
 
         // 切换前候选复核：探测候选，跳过当前不可达者，最多尝试 preSwitchMaxProbe 个
         let target = null;
+        // tag 漂移下，候选池可能残留「当前节点」的旧/新后缀快照，切换前按稳定身份排除
+        candidates = candidates.filter((t) => stableKey(t) !== stableKey(observedNow));
         const maxTry = Math.min(cfg.preSwitchMaxProbe, candidates.length);
         for (let attempt = 0; attempt < maxTry; attempt += 1) {
           const best = bestCandidate();
@@ -397,8 +418,14 @@ export function createMonitor({ api, config, clock, logger }) {
           await api.select(cfg.selectorName, target, cycleController.signal);
         } catch (error) {
           log.warn(`切换到 ${target} 失败`, error?.message || String(error));
+          lastError = `switch failed: ${error?.message}`;
           currentStartAt = now;
-          return { skipped: false, switchedTo: null, error: `switch failed: ${error?.message}` };
+          // 切换失败可能由节点或控制面瞬时问题引起，重置计数避免 failureCount 累积卡死
+          watchFailureCount = 0;
+          watchDegradationCount = 0;
+          watchOptimizeCount = 0;
+          watchSlowCount = 0;
+          return { skipped: false, switchedTo: null, error: lastError };
         }
 
         let confirmNow = null;
@@ -409,18 +436,19 @@ export function createMonitor({ api, config, clock, logger }) {
           confirmNow = null;
         }
 
-        if (confirmNow === target) {
+        if (confirmNow !== null && stableKey(confirmNow) === stableKey(target)) {
           const oldState = ensureNodeState(observedNow);
           nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
           lastSwitch = { from: observedNow, to: target, at: now };
           currentNow = target;
           lastObservedNow = target;
           currentStartAt = now;
-          candidates = candidates.filter((t) => t !== target);
+          candidates = candidates.filter((t) => stableKey(t) !== stableKey(target) && stableKey(t) !== stableKey(observedNow));
           watchBaseline = [];
           watchFailureCount = 0;
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
+          watchSlowCount = 0;
           stalking = true;
           stalkingSuccessCount = 0;
           scheduleStalkProbe();
@@ -429,8 +457,13 @@ export function createMonitor({ api, config, clock, logger }) {
         }
 
         log.warn(`切换确认失败：期望 now=${target} 实际 now=${confirmNow}`);
+        lastError = 'switch confirm failed';
         currentStartAt = now;
-        return { skipped: false, switchedTo: null, error: 'switch confirm failed' };
+        watchFailureCount = 0;
+        watchDegradationCount = 0;
+        watchOptimizeCount = 0;
+        watchSlowCount = 0;
+        return { skipped: false, switchedTo: null, error: lastError };
       }
 
       return { skipped: false, switchedTo: null, error: lastError };
@@ -497,6 +530,7 @@ export function createMonitor({ api, config, clock, logger }) {
         failureCount: watchFailureCount,
         degradationCount: watchDegradationCount,
         optimizeCount: watchOptimizeCount,
+        slowCount: watchSlowCount,
         stalking,
         stalkingSuccessCount,
       },

@@ -10,6 +10,7 @@
 - **外部变化防抖**：用户手动切换 `now` 后，插件不会立即把节点切回旧节点。
 - **双通道探测**：通道 A 高频只探当前节点，快速发现故障；通道 B 低频并发扫描全部成员，维护「候选池」供切换备用，避免 195 个节点同时探测拖垮内核。
 - **延迟劣化判定**：当前节点延迟超过近期基线 `DegradationRatio` 倍且连续 `DegradationThreshold` 次，即使未超时也触发切换，捕捉「能通但慢」的劣化节点。
+- **绝对延迟阈值**：当前节点延迟超过 `MaxDelayMs` 且连续 `SlowThreshold` 次，直接判慢并触发切换，避免「探测 1.4s 但真实 2~5s」的慢节点被误判健康。
 - **全池失败熔断**：候选池单轮失败率超过 `PoolFailureRateThreshold` 时作废本轮、不推进状态，避免探测目标本身故障被误判为全部节点故障。
 - **多 URL 短路探测**：`ProbeUrls` 列表按轮次轮换起始位，对同一节点依次探测、任一 URL 可达即判健康，规避单一探测 URL 被墙或 DNS 污染导致的单点误判。
 - **性能择优**：当前节点延迟超过候选池最优节点 `OptimizeRatio` 倍且连续 `OptimizeThreshold` 次，即使仍可用也切到更低延迟节点，兼顾稳定与速度。
@@ -60,6 +61,7 @@
 | 探测 URL 列表 | `ProbeUrls` | `https://www.gstatic.com/generate_204,https://www.google.com/generate_204,https://github.com` | 节点延迟探测的目标地址，逗号分隔；多 URL 短路探测，任一可达即判健康 |
 | 快探间隔(ms) | `WatchIntervalMs` | `10000` | 通道 A 当前节点快探的间隔 |
 | 快探超时(ms) | `WatchTimeoutMs` | `4000` | 当前节点单次快探的超时 |
+| 绝对延迟阈值(ms) | `MaxDelayMs` | `2000` | 探测成功但延迟超过该值即计「慢」，连续慢达标触发切换 |
 | 候选池刷新间隔(ms) | `PoolRefreshIntervalMs` | `180000` | 通道 B 候选池后台刷新的间隔 |
 | 候选池探测超时(ms) | `PoolTimeoutMs` | `5000` | 候选池单节点探测超时，需足够长以适配 WebView 环境下的排队探测 |
 | 候选池并发 | `PoolConcurrency` | `20` | 候选池同批并发探测的最大节点数 |
@@ -71,6 +73,7 @@
 | 最短驻留(ms) | `MinDwellMs` | `60000` | 切换后至少驻留该时长才允许再次切换 |
 | 延迟劣化倍数 | `DegradationRatio` | `3` | 当前节点延迟超过基线该倍数判为劣化 |
 | 劣化连续次数 | `DegradationThreshold` | `2` | 连续劣化多少次后触发切换 |
+| 慢节点连续次数 | `SlowThreshold` | `2` | 连续多少次超过绝对延迟阈值后触发切换 |
 | 基线窗口 | `BaselineWindow` | `5` | 延迟基线的采样窗口大小 |
 | 择优倍数 | `OptimizeRatio` | `2` | 当前节点延迟超过候选池最优节点该倍数判为需择优 |
 | 择优连续次数 | `OptimizeThreshold` | `3` | 连续需择优多少次后切换到最优候选 |

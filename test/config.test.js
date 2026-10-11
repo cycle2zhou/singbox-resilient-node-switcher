@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_CONFIG, normalizeConfig } from '../src/config.js';
 
-test('normalizeConfig({}) 返回规格中的 21 项默认配置', () => {
+test('normalizeConfig({}) 返回规格中的 23 项默认配置', () => {
   const config = normalizeConfig({});
 
   assert.equal(config.selectorName, '🚀 节点选择');
@@ -13,6 +13,7 @@ test('normalizeConfig({}) 返回规格中的 21 项默认配置', () => {
   ]);
   assert.equal(config.watchIntervalMs, 10000);
   assert.equal(config.watchTimeoutMs, 4000);
+  assert.equal(config.maxDelayMs, 2000);
   assert.equal(config.poolRefreshIntervalMs, 180000);
   assert.equal(config.poolTimeoutMs, 5000);
   assert.equal(config.poolConcurrency, 20);
@@ -24,6 +25,7 @@ test('normalizeConfig({}) 返回规格中的 21 项默认配置', () => {
   assert.equal(config.minDwellMs, 60000);
   assert.equal(config.degradationRatio, 3);
   assert.equal(config.degradationThreshold, 2);
+  assert.equal(config.slowThreshold, 2);
   assert.equal(config.baselineWindow, 5);
   assert.equal(config.optimizeRatio, 2);
   assert.equal(config.optimizeThreshold, 3);
@@ -37,6 +39,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
   const config = normalizeConfig({
     watchIntervalMs: 0,
     watchTimeoutMs: -1,
+    maxDelayMs: -1,
     poolRefreshIntervalMs: 0,
     poolTimeoutMs: -1,
     poolConcurrency: 0,
@@ -47,6 +50,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     minDwellMs: 0,
     degradationRatio: 0,
     degradationThreshold: -1,
+    slowThreshold: 0,
     baselineWindow: 0,
     optimizeRatio: 0,
     optimizeThreshold: -1,
@@ -59,6 +63,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
   for (const key of [
     'watchIntervalMs',
     'watchTimeoutMs',
+    'maxDelayMs',
     'poolRefreshIntervalMs',
     'poolTimeoutMs',
     'initialCooldownMs',
@@ -75,6 +80,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     'failureThreshold',
     'recoveryThreshold',
     'degradationThreshold',
+    'slowThreshold',
     'baselineWindow',
     'optimizeThreshold',
     'stalkSuccessThreshold',
@@ -96,6 +102,7 @@ test('并发、阈值和窗口配置只接受正整数', () => {
     'failureThreshold',
     'recoveryThreshold',
     'degradationThreshold',
+    'slowThreshold',
     'baselineWindow',
     'optimizeThreshold',
     'stalkSuccessThreshold',
@@ -117,6 +124,7 @@ test('并发、阈值和窗口配置只接受正整数', () => {
     failureThreshold: 2,
     recoveryThreshold: 7,
     degradationThreshold: 1,
+    slowThreshold: 1,
     baselineWindow: 3,
     optimizeThreshold: 5,
     stalkSuccessThreshold: 1,
@@ -126,6 +134,7 @@ test('并发、阈值和窗口配置只接受正整数', () => {
   assert.equal(valid.failureThreshold, 2);
   assert.equal(valid.recoveryThreshold, 7);
   assert.equal(valid.degradationThreshold, 1);
+  assert.equal(valid.slowThreshold, 1);
   assert.equal(valid.baselineWindow, 3);
   assert.equal(valid.optimizeThreshold, 5);
   assert.equal(valid.stalkSuccessThreshold, 1);
