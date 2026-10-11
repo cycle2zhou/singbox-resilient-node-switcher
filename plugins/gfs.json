@@ -32,30 +32,66 @@
       "options": []
     },
     {
-      "id": "ID_interval_ms",
-      "title": "检测间隔(ms)",
-      "description": "监控轮次的间隔，默认 30000",
-      "key": "IntervalMs",
+      "id": "ID_probe_urls",
+      "title": "探测 URL 列表",
+      "description": "节点延迟探测的目标地址，逗号分隔，按轮次轮询",
+      "key": "ProbeUrls",
       "component": "Input",
-      "value": "30000",
+      "value": "https://www.gstatic.com/generate_204,https://cp.cloudflare.com/generate_204,https://www.google.com/generate_204",
       "options": []
     },
     {
-      "id": "ID_timeout_ms",
-      "title": "探测超时(ms)",
-      "description": "单次节点延迟探测的超时，默认 5000",
-      "key": "TimeoutMs",
+      "id": "ID_watch_interval_ms",
+      "title": "快探间隔(ms)",
+      "description": "当前节点快探的间隔，默认 10000",
+      "key": "WatchIntervalMs",
+      "component": "Input",
+      "value": "10000",
+      "options": []
+    },
+    {
+      "id": "ID_watch_timeout_ms",
+      "title": "快探超时(ms)",
+      "description": "当前节点单次快探的超时，默认 4000",
+      "key": "WatchTimeoutMs",
+      "component": "Input",
+      "value": "4000",
+      "options": []
+    },
+    {
+      "id": "ID_pool_refresh_interval_ms",
+      "title": "候选池刷新间隔(ms)",
+      "description": "候选池后台刷新的间隔，默认 180000",
+      "key": "PoolRefreshIntervalMs",
+      "component": "Input",
+      "value": "180000",
+      "options": []
+    },
+    {
+      "id": "ID_pool_timeout_ms",
+      "title": "候选池探测超时(ms)",
+      "description": "候选池单节点探测超时，默认 5000",
+      "key": "PoolTimeoutMs",
       "component": "Input",
       "value": "5000",
       "options": []
     },
     {
-      "id": "ID_concurrency",
-      "title": "并发上限",
-      "description": "同一轮次同时探测的最大节点数，默认 3",
-      "key": "Concurrency",
+      "id": "ID_pool_concurrency",
+      "title": "候选池并发",
+      "description": "候选池同批并发探测的最大节点数，默认 20",
+      "key": "PoolConcurrency",
       "component": "Input",
-      "value": "3",
+      "value": "20",
+      "options": []
+    },
+    {
+      "id": "ID_pool_failure_rate_threshold",
+      "title": "全池熔断阈值",
+      "description": "本轮失败率超过该阈值则作废本轮，默认 0.9",
+      "key": "PoolFailureRateThreshold",
+      "component": "Input",
+      "value": "0.9",
       "options": []
     },
     {
@@ -104,12 +140,30 @@
       "options": []
     },
     {
-      "id": "ID_probe_url",
-      "title": "探测 URL",
-      "description": "节点延迟探测的目标地址",
-      "key": "ProbeUrl",
+      "id": "ID_degradation_ratio",
+      "title": "延迟劣化倍数",
+      "description": "当前节点延迟超过基线该倍数判为劣化，默认 3",
+      "key": "DegradationRatio",
       "component": "Input",
-      "value": "https://www.gstatic.com/generate_204",
+      "value": "3",
+      "options": []
+    },
+    {
+      "id": "ID_degradation_threshold",
+      "title": "劣化连续次数",
+      "description": "连续劣化多少次后触发切换，默认 2",
+      "key": "DegradationThreshold",
+      "component": "Input",
+      "value": "2",
+      "options": []
+    },
+    {
+      "id": "ID_baseline_window",
+      "title": "基线窗口",
+      "description": "延迟基线的采样窗口大小，默认 5",
+      "key": "BaselineWindow",
+      "component": "Input",
+      "value": "5",
       "options": []
     }
   ]

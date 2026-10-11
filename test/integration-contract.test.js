@@ -27,15 +27,21 @@ test('元数据触发器覆盖完整生命周期', () => {
 test('README 声明默认值与 src/config.js 一致', () => {
   const expected = [
     DEFAULT_CONFIG.selectorName,
-    String(DEFAULT_CONFIG.intervalMs),
-    String(DEFAULT_CONFIG.timeoutMs),
-    String(DEFAULT_CONFIG.concurrency),
+    ...DEFAULT_CONFIG.probeUrls,
+    String(DEFAULT_CONFIG.watchIntervalMs),
+    String(DEFAULT_CONFIG.watchTimeoutMs),
+    String(DEFAULT_CONFIG.poolRefreshIntervalMs),
+    String(DEFAULT_CONFIG.poolTimeoutMs),
+    String(DEFAULT_CONFIG.poolConcurrency),
+    String(DEFAULT_CONFIG.poolFailureRateThreshold),
     String(DEFAULT_CONFIG.failureThreshold),
     String(DEFAULT_CONFIG.recoveryThreshold),
     String(DEFAULT_CONFIG.initialCooldownMs),
     String(DEFAULT_CONFIG.maxCooldownMs),
     String(DEFAULT_CONFIG.minDwellMs),
-    DEFAULT_CONFIG.probeUrl,
+    String(DEFAULT_CONFIG.degradationRatio),
+    String(DEFAULT_CONFIG.degradationThreshold),
+    String(DEFAULT_CONFIG.baselineWindow),
   ];
   for (const value of expected) {
     assert.ok(readme.includes(value), `README 应包含默认值 ${value}`);

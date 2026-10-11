@@ -58,15 +58,21 @@ test('Plugin-Hub 元数据字段齐全', () => {
 test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
   const expected = {
     SelectorName: DEFAULT_CONFIG.selectorName,
-    IntervalMs: String(DEFAULT_CONFIG.intervalMs),
-    TimeoutMs: String(DEFAULT_CONFIG.timeoutMs),
-    Concurrency: String(DEFAULT_CONFIG.concurrency),
+    ProbeUrls: DEFAULT_CONFIG.probeUrls.join(','),
+    WatchIntervalMs: String(DEFAULT_CONFIG.watchIntervalMs),
+    WatchTimeoutMs: String(DEFAULT_CONFIG.watchTimeoutMs),
+    PoolRefreshIntervalMs: String(DEFAULT_CONFIG.poolRefreshIntervalMs),
+    PoolTimeoutMs: String(DEFAULT_CONFIG.poolTimeoutMs),
+    PoolConcurrency: String(DEFAULT_CONFIG.poolConcurrency),
+    PoolFailureRateThreshold: String(DEFAULT_CONFIG.poolFailureRateThreshold),
     FailureThreshold: String(DEFAULT_CONFIG.failureThreshold),
     RecoveryThreshold: String(DEFAULT_CONFIG.recoveryThreshold),
     InitialCooldownMs: String(DEFAULT_CONFIG.initialCooldownMs),
     MaxCooldownMs: String(DEFAULT_CONFIG.maxCooldownMs),
     MinDwellMs: String(DEFAULT_CONFIG.minDwellMs),
-    ProbeUrl: DEFAULT_CONFIG.probeUrl,
+    DegradationRatio: String(DEFAULT_CONFIG.degradationRatio),
+    DegradationThreshold: String(DEFAULT_CONFIG.degradationThreshold),
+    BaselineWindow: String(DEFAULT_CONFIG.baselineWindow),
   };
 
   for (const [key, value] of Object.entries(expected)) {
@@ -74,6 +80,24 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     assert.ok(item, `缺少配置项 ${key}`);
     assert.equal(item.component, 'Input', `配置项 ${key} 应为 Input`);
     assert.equal(item.value, value, `配置项 ${key} 默认值应与 src/config.js 一致`);
+  }
+});
+
+test('插件源码读取全部双通道配置键', () => {
+  const keys = [
+    'Plugin.WatchIntervalMs',
+    'Plugin.WatchTimeoutMs',
+    'Plugin.PoolRefreshIntervalMs',
+    'Plugin.PoolTimeoutMs',
+    'Plugin.PoolConcurrency',
+    'Plugin.PoolFailureRateThreshold',
+    'Plugin.DegradationRatio',
+    'Plugin.DegradationThreshold',
+    'Plugin.BaselineWindow',
+    'Plugin.ProbeUrls',
+  ];
+  for (const key of keys) {
+    assert.ok(pluginSource.includes(key), `插件源码应读取 ${key}`);
   }
 });
 

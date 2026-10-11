@@ -7,29 +7,44 @@
 const __core = (() => {
 // ---- src/config.js ----
 const DEFAULT_CONFIG = Object.freeze({
-  intervalMs: 30000,
-  timeoutMs: 5000,
-  concurrency: 3,
+  selectorName: '🚀 节点选择',
+  probeUrls: Object.freeze([
+    'https://www.gstatic.com/generate_204',
+    'https://cp.cloudflare.com/generate_204',
+    'https://www.google.com/generate_204',
+  ]),
+  watchIntervalMs: 10000,
+  watchTimeoutMs: 4000,
+  poolRefreshIntervalMs: 180000,
+  poolTimeoutMs: 5000,
+  poolConcurrency: 20,
+  poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
   recoveryThreshold: 2,
   initialCooldownMs: 120000,
   maxCooldownMs: 1800000,
   minDwellMs: 60000,
-  selectorName: '🚀 节点选择',
-  probeUrl: 'https://www.gstatic.com/generate_204',
+  degradationRatio: 3,
+  degradationThreshold: 2,
+  baselineWindow: 5,
 });
 
 const POSITIVE_KEYS = [
-  'intervalMs',
-  'timeoutMs',
+  'watchIntervalMs',
+  'watchTimeoutMs',
+  'poolRefreshIntervalMs',
+  'poolTimeoutMs',
   'initialCooldownMs',
   'minDwellMs',
+  'degradationRatio',
 ];
 
 const POSITIVE_INTEGER_KEYS = [
-  'concurrency',
+  'poolConcurrency',
   'failureThreshold',
   'recoveryThreshold',
+  'degradationThreshold',
+  'baselineWindow',
 ];
 
 function positiveNumber(value, fallback) {
@@ -38,6 +53,16 @@ function positiveNumber(value, fallback) {
 
 function positiveInteger(value, fallback) {
   return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function normalizeProbeUrls(value) {
+  if (!Array.isArray(value)) return DEFAULT_CONFIG.probeUrls;
+  const filtered = value.filter((url) => typeof url === 'string' && url.trim());
+  return filtered.length > 0 ? filtered : DEFAULT_CONFIG.probeUrls;
+}
+
+function normalizePoolFailureRateThreshold(value, fallback) {
+  return Number.isFinite(value) && value > 0 && value <= 1 ? value : fallback;
 }
 
 function normalizeConfig(input = {}) {
@@ -58,9 +83,11 @@ function normalizeConfig(input = {}) {
     ? source.selectorName
     : DEFAULT_CONFIG.selectorName;
 
-  config.probeUrl = typeof source.probeUrl === 'string' && source.probeUrl.trim()
-    ? source.probeUrl
-    : DEFAULT_CONFIG.probeUrl;
+  config.probeUrls = normalizeProbeUrls(source.probeUrls);
+  config.poolFailureRateThreshold = normalizePoolFailureRateThreshold(
+    source.poolFailureRateThreshold,
+    DEFAULT_CONFIG.poolFailureRateThreshold,
+  );
 
   return config;
 }
@@ -255,6 +282,23 @@ function isEligibleCandidate(state, now) {
   return state.status === STATUS.HEALTHY || state.status === STATUS.SUSPECT;
 }
 
+function markCooldown(state, now, config) {
+  if (!state || typeof state !== 'object') {
+    throw new TypeError('节点状态必须是对象');
+  }
+  if (!Number.isFinite(now)) {
+    throw new TypeError('now 必须是有限数字');
+  }
+
+  return {
+    ...state,
+    status: STATUS.COOLDOWN,
+    cooldownMs: config.initialCooldownMs,
+    cooldownUntil: now + config.initialCooldownMs,
+    recoverySuccessCount: 0,
+  };
+}
+
 
 // ---- src/api.js ----
 
@@ -345,14 +389,9 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
     async probe(node, url, timeoutMs, signal) {
       const encodedNode = encodeURIComponent(node);
       const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
-      const combined = combineSignal(signal, timeoutMs);
-      try {
-        const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, combined.signal);
-        if (!result.ok) return result;
-        return parseDelayResponse(result.status, result.body);
-      } finally {
-        combined.cleanup();
-      }
+      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs);
+      if (!result.ok) return result;
+      return parseDelayResponse(result.status, result.body);
     },
 
     async select(group, node, signal) {
@@ -375,14 +414,20 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
 
 // ---- src/monitor.js ----
 
-const DEFAULT_PROBE_URL = 'https://www.gstatic.com/generate_204';
-
 function silentLogger() {
   return {
     info() {},
     warn() {},
     error() {},
   };
+}
+
+function median(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 function createMonitor({ api, config, clock, logger }) {
@@ -398,10 +443,21 @@ function createMonitor({ api, config, clock, logger }) {
   let currentStartAt = null;
   let lastError = null;
   let lastSwitch = null;
+  let candidates = [];
   let running = false;
-  let cycleInProgress = false;
-  let timer = null;
-  let controller = null;
+  let watchInProgress = false;
+  let poolInProgress = false;
+  let watchTimer = null;
+  let poolTimer = null;
+  let watchController = null;
+  let poolController = null;
+
+  // 通道 A 专用状态
+  let watchBaseline = [];
+  let watchFailureCount = 0;
+  let watchDegradationCount = 0;
+  let watchCycleCount = 0;
+  let poolCycleCount = 0;
 
   function ensureNodeState(tag) {
     if (!nodeStates.has(tag)) {
@@ -410,11 +466,13 @@ function createMonitor({ api, config, clock, logger }) {
     return nodeStates.get(tag);
   }
 
-  function probeUrl() {
-    return typeof cfg.probeUrl === 'string' && cfg.probeUrl.trim() ? cfg.probeUrl : DEFAULT_PROBE_URL;
+  function probeUrl(cycleCount) {
+    const urls = cfg.probeUrls;
+    if (!Array.isArray(urls) || urls.length === 0) return null;
+    return urls[cycleCount % urls.length];
   }
 
-  async function runProbe(tag, signal) {
+  async function runPoolProbe(tag, signal, url) {
     const now = time.now();
     const state = ensureNodeState(tag);
     const plan = getProbePlan(state, now, cfg);
@@ -424,7 +482,7 @@ function createMonitor({ api, config, clock, logger }) {
     }
     let result;
     try {
-      result = await api.probe(tag, probeUrl(), cfg.timeoutMs, signal);
+      result = await api.probe(tag, url, cfg.poolTimeoutMs, signal);
     } catch (error) {
       result = { ok: false, reason: error?.message || String(error) };
     }
@@ -437,13 +495,110 @@ function createMonitor({ api, config, clock, logger }) {
     return { tag, probed: true, ok: false };
   }
 
-  async function runCycle() {
-    if (cycleInProgress) {
+  async function poolCycle() {
+    if (poolInProgress) {
+      return { skipped: true, error: null };
+    }
+    poolInProgress = true;
+    const cycleController = new AbortController();
+    poolController = cycleController;
+    const snapshotStates = new Map([...nodeStates].map(([k, v]) => [k, { ...v }]));
+    const snapshotCandidates = [...candidates];
+
+    try {
+      let data;
+      try {
+        data = await api.getProxies(cycleController.signal);
+      } catch (error) {
+        lastError = error?.message || String(error);
+        log.error('无法读取主 Selector 状态', lastError);
+        return { skipped: false, error: lastError };
+      }
+
+      const proxies = data?.proxies;
+      if (!proxies || typeof proxies !== 'object') {
+        lastError = 'proxies 响应缺失';
+        log.error(lastError);
+        return { skipped: false, error: lastError };
+      }
+
+      const selector = proxies[cfg.selectorName];
+      if (!selector) {
+        lastError = `主 Selector「${cfg.selectorName}」不存在`;
+        log.error(lastError);
+        return { skipped: false, error: lastError };
+      }
+      if (selector.type !== 'Selector') {
+        lastError = `主 Selector「${cfg.selectorName}」类型为 ${selector.type}，非 Selector`;
+        log.error(lastError);
+        return { skipped: false, error: lastError };
+      }
+      const all = Array.isArray(selector.all) ? selector.all : [];
+      if (all.length === 0) {
+        lastError = `主 Selector「${cfg.selectorName}」无成员`;
+        log.error(lastError);
+        return { skipped: false, error: lastError };
+      }
+
+      lastError = null;
+      members = [...all];
+      memberTypes = {};
+      for (const tag of members) {
+        memberTypes[tag] = proxies[tag]?.type ?? 'unknown';
+        ensureNodeState(tag);
+      }
+      for (const tag of [...nodeStates.keys()]) {
+        if (!members.includes(tag)) nodeStates.delete(tag);
+      }
+
+      currentNow = selector.now;
+
+      // 探测目标：跳过当前 now 与 URLTest，本轮统一使用一个探测 URL
+      const probeTargets = members.filter((tag) => tag !== currentNow && memberTypes[tag] !== 'URLTest');
+      const url = probeUrl(poolCycleCount);
+
+      const results = [];
+      for (let i = 0; i < probeTargets.length; i += cfg.poolConcurrency) {
+        const batch = probeTargets.slice(i, i + cfg.poolConcurrency);
+        const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, url)));
+        results.push(...batchResults);
+      }
+
+      // 全池失败熔断：实际探测节点失败率超过阈值则本轮作废
+      const probed = results.filter((r) => r.probed);
+      if (probed.length > 0) {
+        const failures = probed.filter((r) => !r.ok).length;
+        const failureRate = failures / probed.length;
+        if (failureRate > cfg.poolFailureRateThreshold) {
+          nodeStates.clear();
+          for (const [k, v] of snapshotStates) nodeStates.set(k, v);
+          candidates = snapshotCandidates;
+          lastError = '全池探测失败率超过阈值，判定为探测目标/API 故障，本轮作废';
+          log.warn(lastError);
+          return { skipped: false, error: lastError };
+        }
+      }
+
+      candidates = probeTargets.filter((tag) => {
+        const st = nodeStates.get(tag);
+        return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
+      });
+
+      return { skipped: false, error: null };
+    } finally {
+      poolInProgress = false;
+      poolController = null;
+      poolCycleCount += 1;
+    }
+  }
+
+  async function watchCycle() {
+    if (watchInProgress) {
       return { skipped: true, switchedTo: null, error: null };
     }
-    cycleInProgress = true;
+    watchInProgress = true;
     const cycleController = new AbortController();
-    controller = cycleController;
+    watchController = cycleController;
 
     try {
       let data;
@@ -473,129 +628,130 @@ function createMonitor({ api, config, clock, logger }) {
         log.error(lastError);
         return { skipped: false, switchedTo: null, error: lastError };
       }
-      const all = Array.isArray(selector.all) ? selector.all : [];
-      if (all.length === 0) {
-        lastError = `主 Selector「${cfg.selectorName}」无成员`;
-        log.error(lastError);
-        return { skipped: false, switchedTo: null, error: lastError };
-      }
-
-      lastError = null;
-      members = [...all];
-      memberTypes = {};
-      for (const tag of members) {
-        memberTypes[tag] = proxies[tag]?.type ?? 'unknown';
-        ensureNodeState(tag);
-      }
-      for (const tag of [...nodeStates.keys()]) {
-        if (!members.includes(tag)) nodeStates.delete(tag);
-      }
 
       const now = time.now();
-      currentNow = selector.now;
+      const observedNow = selector.now;
 
-      // 外部选择变化防抖：接受新选择为事实，重置其失败窗口，不切回旧节点
-      if (lastObservedNow !== null && lastObservedNow !== currentNow) {
-        const st = nodeStates.get(currentNow);
-        if (st) {
-          nodeStates.set(currentNow, {
-            ...st,
-            status: 'healthy',
-            failureCount: 0,
-            recoverySuccessCount: 0,
-            cooldownMs: 0,
-            cooldownUntil: null,
-            lastError: null,
-          });
-        }
+      // 外部变化检测：接受新选择、重置快探窗口，不切回旧节点
+      if (lastObservedNow !== null && lastObservedNow !== observedNow) {
+        watchBaseline = [];
+        watchFailureCount = 0;
+        watchDegradationCount = 0;
         currentStartAt = now;
       }
       if (currentStartAt === null) {
         currentStartAt = now;
       }
-      lastObservedNow = currentNow;
+      lastObservedNow = observedNow;
+      currentNow = observedNow;
 
-      // 主动探测（并发受限，分批）
-      const probeOrder = members;
-      for (let i = 0; i < probeOrder.length; i += cfg.concurrency) {
-        const batch = probeOrder.slice(i, i + cfg.concurrency);
-        await Promise.all(batch.map((tag) => runProbe(tag, cycleController.signal)));
+      lastError = null;
+
+      // 只探测当前 now，探测 URL 按轮次轮换
+      let result;
+      try {
+        result = await api.probe(observedNow, probeUrl(watchCycleCount), cfg.watchTimeoutMs, cycleController.signal);
+      } catch (error) {
+        result = { ok: false, reason: error?.message || String(error) };
       }
 
-      // 判断当前节点是否故障并满足驻留时间
-      const curState = nodeStates.get(currentNow);
-      const curFailed = curState && curState.status === 'cooldown';
+      if (result && result.ok) {
+        watchBaseline.push(result.delay);
+        if (watchBaseline.length > cfg.baselineWindow) {
+          watchBaseline = watchBaseline.slice(-cfg.baselineWindow);
+        }
+        watchFailureCount = 0;
+        if (watchBaseline.length >= cfg.baselineWindow && result.delay > median(watchBaseline) * cfg.degradationRatio) {
+          watchDegradationCount += 1;
+        } else {
+          watchDegradationCount = 0;
+        }
+      } else {
+        watchFailureCount += 1;
+        watchDegradationCount = 0;
+      }
+
+      const shouldSwitch = (watchFailureCount >= cfg.failureThreshold) || (watchDegradationCount >= cfg.degradationThreshold);
       const dwellSatisfied = now >= (currentStartAt ?? now) + cfg.minDwellMs;
 
-      if (curFailed && dwellSatisfied) {
-        const candidates = members
-          .filter((tag) => tag !== currentNow)
-          .filter((tag) => isEligibleCandidate(nodeStates.get(tag), now))
-          .filter((tag) => {
-            const st = nodeStates.get(tag);
-            return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
-          });
-
-        if (candidates.length > 0) {
-          const target = candidates[0];
-          try {
-            await api.select(cfg.selectorName, target, cycleController.signal);
-          } catch (error) {
-            log.warn(`切换到 ${target} 失败`, error?.message || String(error));
-            currentStartAt = now;
-            return { skipped: false, switchedTo: null, error: `switch failed: ${error?.message}` };
-          }
-
-          // 三段式确认：刷新并核对 now
-          let confirmNow = null;
-          try {
-            const refreshed = await api.getProxies(cycleController.signal);
-            confirmNow = refreshed?.proxies?.[cfg.selectorName]?.now ?? null;
-          } catch (error) {
-            confirmNow = null;
-          }
-
-          if (confirmNow === target) {
-            lastSwitch = { from: currentNow, to: target, at: now };
-            currentNow = target;
-            lastObservedNow = target;
-            currentStartAt = now;
-            log.info(`已切换到 ${target}`);
-            return { skipped: false, switchedTo: target, error: null };
-          }
-          log.warn(`切换确认失败：期望 now=${target} 实际 now=${confirmNow}`);
-          currentStartAt = now;
-          return { skipped: false, switchedTo: null, error: 'switch confirm failed' };
+      if (shouldSwitch && dwellSatisfied) {
+        if (candidates.length === 0) {
+          lastError = '候选池为空，等待通道 B 刷新';
+          log.info(lastError);
+          return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        log.info('当前节点故障但无合格候选，保留当前选择');
+        const target = candidates[0];
+        try {
+          await api.select(cfg.selectorName, target, cycleController.signal);
+        } catch (error) {
+          log.warn(`切换到 ${target} 失败`, error?.message || String(error));
+          currentStartAt = now;
+          return { skipped: false, switchedTo: null, error: `switch failed: ${error?.message}` };
+        }
+
+        let confirmNow = null;
+        try {
+          const refreshed = await api.getProxies(cycleController.signal);
+          confirmNow = refreshed?.proxies?.[cfg.selectorName]?.now ?? null;
+        } catch (error) {
+          confirmNow = null;
+        }
+
+        if (confirmNow === target) {
+          const oldState = ensureNodeState(observedNow);
+          nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
+          lastSwitch = { from: observedNow, to: target, at: now };
+          currentNow = target;
+          lastObservedNow = target;
+          currentStartAt = now;
+          candidates = candidates.filter((t) => t !== target);
+          watchBaseline = [];
+          watchFailureCount = 0;
+          watchDegradationCount = 0;
+          log.info(`已切换到 ${target}`);
+          return { skipped: false, switchedTo: target, error: null };
+        }
+
+        log.warn(`切换确认失败：期望 now=${target} 实际 now=${confirmNow}`);
+        currentStartAt = now;
+        return { skipped: false, switchedTo: null, error: 'switch confirm failed' };
       }
 
       return { skipped: false, switchedTo: null, error: lastError };
     } finally {
-      cycleInProgress = false;
-      controller = null;
+      watchInProgress = false;
+      watchController = null;
+      watchCycleCount += 1;
     }
   }
 
   function start() {
     if (running) return;
     running = true;
-    timer = setInterval(() => {
-      runCycle().catch((error) => log.error('监控轮次异常', error?.message || String(error)));
-    }, cfg.intervalMs);
+    poolCycle().catch((error) => log.error('候选池预热异常', error?.message || String(error)));
+    watchTimer = setInterval(() => {
+      watchCycle().catch((error) => log.error('快探轮次异常', error?.message || String(error)));
+    }, cfg.watchIntervalMs);
+    poolTimer = setInterval(() => {
+      poolCycle().catch((error) => log.error('候选池轮次异常', error?.message || String(error)));
+    }, cfg.poolRefreshIntervalMs);
   }
 
   function stop() {
     running = false;
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
+    if (watchTimer) {
+      clearInterval(watchTimer);
+      watchTimer = null;
     }
-    if (controller) {
-      controller.abort();
-      controller = null;
+    if (poolTimer) {
+      clearInterval(poolTimer);
+      poolTimer = null;
     }
+    watchController?.abort();
+    watchController = null;
+    poolController?.abort();
+    poolController = null;
   }
 
   function getSnapshot() {
@@ -606,17 +762,25 @@ function createMonitor({ api, config, clock, logger }) {
     return {
       selectorName: cfg.selectorName,
       running,
-      cycleInProgress,
+      watchInProgress,
+      poolInProgress,
       currentNow,
       members: [...members],
       memberTypes: { ...memberTypes },
       nodeStates: states,
       lastError,
       lastSwitch: lastSwitch ? { ...lastSwitch } : null,
+      channelA: {
+        baseline: [...watchBaseline],
+        lastDelay: watchBaseline.length > 0 ? watchBaseline[watchBaseline.length - 1] : null,
+        failureCount: watchFailureCount,
+        degradationCount: watchDegradationCount,
+      },
+      candidates: [...candidates],
     };
   }
 
-  return { runCycle, start, stop, getSnapshot };
+  return { start, stop, getSnapshot, watchCycle, poolCycle };
 }
 
   return {
@@ -630,6 +794,7 @@ function createMonitor({ api, config, clock, logger }) {
     recordProbeSuccess,
     getProbePlan,
     isEligibleCandidate,
+    markCooldown,
     createMonitor,
   };
 })();
@@ -672,15 +837,23 @@ export default (Plugin) => {
   function buildConfig() {
     return {
       selectorName: Plugin.SelectorName,
-      intervalMs: Number(Plugin.IntervalMs),
-      timeoutMs: Number(Plugin.TimeoutMs),
-      concurrency: Number(Plugin.Concurrency),
+      probeUrls: typeof Plugin.ProbeUrls === 'string'
+        ? Plugin.ProbeUrls.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      watchIntervalMs: Number(Plugin.WatchIntervalMs),
+      watchTimeoutMs: Number(Plugin.WatchTimeoutMs),
+      poolRefreshIntervalMs: Number(Plugin.PoolRefreshIntervalMs),
+      poolTimeoutMs: Number(Plugin.PoolTimeoutMs),
+      poolConcurrency: Number(Plugin.PoolConcurrency),
+      poolFailureRateThreshold: Number(Plugin.PoolFailureRateThreshold),
       failureThreshold: Number(Plugin.FailureThreshold),
       recoveryThreshold: Number(Plugin.RecoveryThreshold),
       initialCooldownMs: Number(Plugin.InitialCooldownMs),
       maxCooldownMs: Number(Plugin.MaxCooldownMs),
       minDwellMs: Number(Plugin.MinDwellMs),
-      probeUrl: Plugin.ProbeUrl,
+      degradationRatio: Number(Plugin.DegradationRatio),
+      degradationThreshold: Number(Plugin.DegradationThreshold),
+      baselineWindow: Number(Plugin.BaselineWindow),
     };
   }
 
@@ -730,7 +903,7 @@ export default (Plugin) => {
     apiClient = __core.createClashApi({
       baseUrl: endpoint.baseUrl,
       secret: endpoint.secret,
-      timeoutMs: config.timeoutMs,
+      timeoutMs: config.poolTimeoutMs,
     });
     monitor = __core.createMonitor({
       api: apiClient,
@@ -773,6 +946,9 @@ export default (Plugin) => {
       <template #title-suffix>
         <div class="font-bold">
           {{ isRunning ? '监控中' : '已停止' }} · 当前节点：{{ currentNow || '-' }}
+          <span v-if="lastSwitchText" style="margin-left: 8px; font-weight: normal">
+            · 上次切换 {{ lastSwitchText }}
+          </span>
         </div>
       </template>
       <template #extra>
@@ -781,10 +957,24 @@ export default (Plugin) => {
       </template>
       <Alert v-if="lastError" type="warning" :message="'最近错误：' + lastError" style="margin-bottom: 8px" />
       <Table :data-source="rows" :columns="columns" size="small" />
+      <div v-if="candidates.length" style="margin-top: 8px">
+        <div class="font-bold" style="margin-bottom: 4px">候选池</div>
+        <div>
+          <Tag v-for="tag in candidates" :key="tag" style="margin-right: 4px">{{ tag }}</Tag>
+        </div>
+      </div>
     </Card>`,
       setup() {
         const columns = [
-          { title: '节点名', key: 'tag', align: 'left' },
+          {
+            title: '节点名',
+            key: 'tag',
+            align: 'left',
+            customRender({ value, record }) {
+              const label = record && record.isCurrent ? `${value}（当前）` : value;
+              return record && record.isCurrent ? h('b', label) : label;
+            },
+          },
           {
             title: '状态',
             key: 'status',
@@ -815,24 +1005,34 @@ export default (Plugin) => {
         const rows = computed(() => {
           const snap = snapshot.value;
           if (!snap) return [];
-          return snap.members.map((tag) => {
-            const st = snap.nodeStates[tag] || {};
-            return {
-              tag,
-              status: st.status,
-              lastDelay: st.lastDelay,
-              failureCount: st.failureCount,
-              recoverySuccessCount: st.recoverySuccessCount,
-              cooldownUntil: st.cooldownUntil,
-            };
-          });
+          return snap.members
+            .map((tag) => {
+              const st = snap.nodeStates[tag] || {};
+              return {
+                tag,
+                isCurrent: tag === snap.currentNow,
+                status: st.status,
+                lastDelay: st.lastDelay,
+                failureCount: st.failureCount,
+                recoverySuccessCount: st.recoverySuccessCount,
+                cooldownUntil: st.cooldownUntil,
+              };
+            })
+            .sort((a, b) => (a.isCurrent === b.isCurrent ? 0 : a.isCurrent ? -1 : 1));
         });
         const currentNow = computed(() => (snapshot.value ? snapshot.value.currentNow : null));
         const lastError = computed(() => (snapshot.value ? snapshot.value.lastError : null));
+        const candidates = computed(() => (snapshot.value ? snapshot.value.candidates : []));
+        const lastSwitchText = computed(() => {
+          const ls = snapshot.value ? snapshot.value.lastSwitch : null;
+          return ls ? `${ls.from} → ${ls.to}` : '';
+        });
         return {
           isRunning,
           currentNow,
           lastError,
+          candidates,
+          lastSwitchText,
           rows,
           columns,
           handleStart() {

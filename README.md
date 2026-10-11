@@ -43,15 +43,21 @@
 | 配置项 | 键 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | 主 Selector 名称 | `SelectorName` | `🚀 节点选择` | 需要监控并切换的主策略组 |
-| 检测间隔(ms) | `IntervalMs` | `30000` | 监控轮次的间隔 |
-| 探测超时(ms) | `TimeoutMs` | `5000` | 单次节点延迟探测的超时 |
-| 并发上限 | `Concurrency` | `3` | 同一轮次同时探测的最大节点数 |
+| 探测 URL 列表 | `ProbeUrls` | `https://www.gstatic.com/generate_204,https://cp.cloudflare.com/generate_204,https://www.google.com/generate_204` | 节点延迟探测的目标地址，逗号分隔，按轮次轮询 |
+| 快探间隔(ms) | `WatchIntervalMs` | `10000` | 通道 A 当前节点快探的间隔 |
+| 快探超时(ms) | `WatchTimeoutMs` | `4000` | 当前节点单次快探的超时 |
+| 候选池刷新间隔(ms) | `PoolRefreshIntervalMs` | `180000` | 通道 B 候选池后台刷新的间隔 |
+| 候选池探测超时(ms) | `PoolTimeoutMs` | `5000` | 候选池单节点探测超时 |
+| 候选池并发 | `PoolConcurrency` | `20` | 候选池同批并发探测的最大节点数 |
+| 全池熔断阈值 | `PoolFailureRateThreshold` | `0.9` | 本轮失败率超过该阈值则作废本轮 |
 | 失败阈值 | `FailureThreshold` | `3` | 连续失败多少次后进入冷却 |
 | 恢复阈值 | `RecoveryThreshold` | `2` | 半开状态下连续成功多少次后恢复健康 |
 | 初始冷却(ms) | `InitialCooldownMs` | `120000` | 首次进入冷却的时长 |
 | 最大冷却(ms) | `MaxCooldownMs` | `1800000` | 指数退避的冷却上限 |
 | 最短驻留(ms) | `MinDwellMs` | `60000` | 切换后至少驻留该时长才允许再次切换 |
-| 探测 URL | `ProbeUrl` | `https://www.gstatic.com/generate_204` | 节点延迟探测的目标地址 |
+| 延迟劣化倍数 | `DegradationRatio` | `3` | 当前节点延迟超过基线该倍数判为劣化 |
+| 劣化连续次数 | `DegradationThreshold` | `2` | 连续劣化多少次后触发切换 |
+| 基线窗口 | `BaselineWindow` | `5` | 延迟基线的采样窗口大小 |
 
 ## 状态机
 

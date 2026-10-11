@@ -36,15 +36,23 @@ export default (Plugin) => {
   function buildConfig() {
     return {
       selectorName: Plugin.SelectorName,
-      intervalMs: Number(Plugin.IntervalMs),
-      timeoutMs: Number(Plugin.TimeoutMs),
-      concurrency: Number(Plugin.Concurrency),
+      probeUrls: typeof Plugin.ProbeUrls === 'string'
+        ? Plugin.ProbeUrls.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      watchIntervalMs: Number(Plugin.WatchIntervalMs),
+      watchTimeoutMs: Number(Plugin.WatchTimeoutMs),
+      poolRefreshIntervalMs: Number(Plugin.PoolRefreshIntervalMs),
+      poolTimeoutMs: Number(Plugin.PoolTimeoutMs),
+      poolConcurrency: Number(Plugin.PoolConcurrency),
+      poolFailureRateThreshold: Number(Plugin.PoolFailureRateThreshold),
       failureThreshold: Number(Plugin.FailureThreshold),
       recoveryThreshold: Number(Plugin.RecoveryThreshold),
       initialCooldownMs: Number(Plugin.InitialCooldownMs),
       maxCooldownMs: Number(Plugin.MaxCooldownMs),
       minDwellMs: Number(Plugin.MinDwellMs),
-      probeUrl: Plugin.ProbeUrl,
+      degradationRatio: Number(Plugin.DegradationRatio),
+      degradationThreshold: Number(Plugin.DegradationThreshold),
+      baselineWindow: Number(Plugin.BaselineWindow),
     };
   }
 
@@ -94,7 +102,7 @@ export default (Plugin) => {
     apiClient = __core.createClashApi({
       baseUrl: endpoint.baseUrl,
       secret: endpoint.secret,
-      timeoutMs: config.timeoutMs,
+      timeoutMs: config.poolTimeoutMs,
     });
     monitor = __core.createMonitor({
       api: apiClient,
@@ -137,6 +145,9 @@ export default (Plugin) => {
       <template #title-suffix>
         <div class="font-bold">
           {{ isRunning ? '监控中' : '已停止' }} · 当前节点：{{ currentNow || '-' }}
+          <span v-if="lastSwitchText" style="margin-left: 8px; font-weight: normal">
+            · 上次切换 {{ lastSwitchText }}
+          </span>
         </div>
       </template>
       <template #extra>
@@ -145,10 +156,24 @@ export default (Plugin) => {
       </template>
       <Alert v-if="lastError" type="warning" :message="'最近错误：' + lastError" style="margin-bottom: 8px" />
       <Table :data-source="rows" :columns="columns" size="small" />
+      <div v-if="candidates.length" style="margin-top: 8px">
+        <div class="font-bold" style="margin-bottom: 4px">候选池</div>
+        <div>
+          <Tag v-for="tag in candidates" :key="tag" style="margin-right: 4px">{{ tag }}</Tag>
+        </div>
+      </div>
     </Card>`,
       setup() {
         const columns = [
-          { title: '节点名', key: 'tag', align: 'left' },
+          {
+            title: '节点名',
+            key: 'tag',
+            align: 'left',
+            customRender({ value, record }) {
+              const label = record && record.isCurrent ? `${value}（当前）` : value;
+              return record && record.isCurrent ? h('b', label) : label;
+            },
+          },
           {
             title: '状态',
             key: 'status',
@@ -179,24 +204,34 @@ export default (Plugin) => {
         const rows = computed(() => {
           const snap = snapshot.value;
           if (!snap) return [];
-          return snap.members.map((tag) => {
-            const st = snap.nodeStates[tag] || {};
-            return {
-              tag,
-              status: st.status,
-              lastDelay: st.lastDelay,
-              failureCount: st.failureCount,
-              recoverySuccessCount: st.recoverySuccessCount,
-              cooldownUntil: st.cooldownUntil,
-            };
-          });
+          return snap.members
+            .map((tag) => {
+              const st = snap.nodeStates[tag] || {};
+              return {
+                tag,
+                isCurrent: tag === snap.currentNow,
+                status: st.status,
+                lastDelay: st.lastDelay,
+                failureCount: st.failureCount,
+                recoverySuccessCount: st.recoverySuccessCount,
+                cooldownUntil: st.cooldownUntil,
+              };
+            })
+            .sort((a, b) => (a.isCurrent === b.isCurrent ? 0 : a.isCurrent ? -1 : 1));
         });
         const currentNow = computed(() => (snapshot.value ? snapshot.value.currentNow : null));
         const lastError = computed(() => (snapshot.value ? snapshot.value.lastError : null));
+        const candidates = computed(() => (snapshot.value ? snapshot.value.candidates : []));
+        const lastSwitchText = computed(() => {
+          const ls = snapshot.value ? snapshot.value.lastSwitch : null;
+          return ls ? `${ls.from} → ${ls.to}` : '';
+        });
         return {
           isRunning,
           currentNow,
           lastError,
+          candidates,
+          lastSwitchText,
           rows,
           columns,
           handleStart() {
