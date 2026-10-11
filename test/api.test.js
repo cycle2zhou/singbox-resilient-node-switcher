@@ -136,3 +136,16 @@ test('select uses PUT with encoded group and {name: node} payload', async () => 
   assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
   assert.match(calls[0].url, /\/proxies\/main%20group$/);
 });
+
+test('probe 超时归类为 request timeout，非 request aborted', async () => {
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason));
+    }),
+  });
+  const result = await api.probe('node', 'https://example.test', 1);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /timeout/i);
+  assert.doesNotMatch(result.reason, /abort/i);
+});

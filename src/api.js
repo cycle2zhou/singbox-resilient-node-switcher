@@ -87,14 +87,9 @@ export function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = 
     async probe(node, url, timeoutMs, signal) {
       const encodedNode = encodeURIComponent(node);
       const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
-      const combined = combineSignal(signal, timeoutMs);
-      try {
-        const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, combined.signal);
-        if (!result.ok) return result;
-        return parseDelayResponse(result.status, result.body);
-      } finally {
-        combined.cleanup();
-      }
+      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs);
+      if (!result.ok) return result;
+      return parseDelayResponse(result.status, result.body);
     },
 
     async select(group, node, signal) {
