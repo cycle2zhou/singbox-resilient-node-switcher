@@ -127,3 +127,20 @@ export function isEligibleCandidate(state, now) {
   }
   return state.status === STATUS.HEALTHY || state.status === STATUS.SUSPECT;
 }
+
+export function markCooldown(state, now, config) {
+  if (!state || typeof state !== 'object') {
+    throw new TypeError('节点状态必须是对象');
+  }
+  if (!Number.isFinite(now)) {
+    throw new TypeError('now 必须是有限数字');
+  }
+
+  return {
+    ...state,
+    status: STATUS.COOLDOWN,
+    cooldownMs: config.initialCooldownMs,
+    cooldownUntil: now + config.initialCooldownMs,
+    recoverySuccessCount: 0,
+  };
+}

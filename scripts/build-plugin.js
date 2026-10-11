@@ -29,6 +29,7 @@ const EXPORTS = [
   'recordProbeSuccess',
   'getProbePlan',
   'isEligibleCandidate',
+  'markCooldown',
   'createMonitor',
 ];
 

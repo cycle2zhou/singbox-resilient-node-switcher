@@ -7,6 +7,7 @@ import {
   recordProbeSuccess,
   recordProbeFailure,
   isEligibleCandidate,
+  markCooldown,
 } from '../src/health-state.js';
 
 const config = DEFAULT_CONFIG;
@@ -123,5 +124,16 @@ test('状态机为纯函数，不修改传入状态', () => {
   const next = recordProbeFailure(state, t0 + 2, 'x', config);
 
   assert.deepEqual(state, snapshot);
+  assert.notEqual(next, state);
+});
+
+test('markCooldown 把节点显式置为 cooldown 并设冷却截止', () => {
+  const state = createNodeState('n0');
+  const next = markCooldown(state, 1000, { initialCooldownMs: 120000 });
+
+  assert.equal(next.status, 'cooldown');
+  assert.equal(next.cooldownMs, 120000);
+  assert.equal(next.cooldownUntil, 121000);
+  assert.equal(next.recoverySuccessCount, 0);
   assert.notEqual(next, state);
 });
