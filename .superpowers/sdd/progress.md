@@ -11,3 +11,5 @@ Task 4: complete (node --test -> 30/30 pass; monitor.js 同步all/now+URLTest不
 Task 5: complete (node --test -> 38/38 pass; plugin-adapter.js GFS 胶水 + build-plugin.js 零依赖内联 + gfs.json 元数据 + 单文件插件 27311B + plugin-source.test.js 7 审计测试; probeUrl 归一化缺失已修复)
 
 Task 6: complete (node --test -> 42/42 pass; openspec validate --all --json -> valid; README 安装/配置/状态机/限制/回滚 + integration-contract.test.js 4 契约测试)
+
+本地验证（真实 sing-box 127.0.0.1:20123）：只读 getProxies/probe 解析 OK；三段式切换 PUT+now 确认 PASS；完整 runCycle 195 成员探测+快照 OK。发现并修复真实 bug：stop 在探测进行中置空 controller 导致 null.signal 崩溃（dcd4898），加回归测试 monitor.test.js 第 8 条，全量 43/43。
