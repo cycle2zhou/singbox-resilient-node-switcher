@@ -912,3 +912,85 @@ test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测
   assert.deepEqual(selected, ['n1'], '真实访问全失败应触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
 });
+
+test('真实延迟探测：多 URL 取最慢延迟，快 URL 不掩盖慢 URL', async () => {
+  // 真实探测多个 URL 取最慢，避免「快 URL 掩盖慢 URL」漏判
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }), // sing-box 探测快
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // github 慢 150ms（> realDelayMs=100），google 快 20ms；应取最慢的 github 150ms
+  const httpGetImpl = async (url) => {
+    const delay = url.includes('github') ? 150 : 20;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return { body: 'ok' };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 100, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n1'], '多 URL 应取最慢延迟，慢 URL 触发切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+});
+
+test('真实延迟探测：慢→快重置 realSlowCount，偶发慢不误触发切换', async () => {
+  // 真实延迟从慢恢复到快，realSlowCount 应重置；realSlowThreshold=2 需连续 2 次慢才切换
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // 单 URL：第 1 次慢（150ms > realDelayMs=100），之后快（20ms）
+  let calls = 0;
+  const httpGetImpl = async () => {
+    calls += 1;
+    const delay = calls === 1 ? 150 : 20;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return { body: 'ok' };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 100, realProbeTimeoutMs: 500, realSlowThreshold: 2, realProbeUrls: ['https://github.com'] },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 5; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, [], '偶发慢后恢复快不应触发切换');
+  assert.equal(monitor.getSnapshot().channelA.realSlowCount, 0, '恢复快后 realSlowCount 应重置为 0');
+});
