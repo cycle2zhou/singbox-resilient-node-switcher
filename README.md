@@ -8,6 +8,10 @@
 - **可恢复冷却**：故障节点进入指数退避冷却，到期后半开探测，连续成功才回到健康，不会被永久剔除。
 - **三段式切换确认**：候选探测成功 → PUT 切换 → 刷新确认 `now`，任一环节失败都不会误报切换成功。
 - **外部变化防抖**：用户手动切换 `now` 后，插件不会立即把节点切回旧节点。
+- **双通道探测**：通道 A 高频只探当前节点，快速发现故障；通道 B 低频并发扫描全部成员，维护「候选池」供切换备用，避免 195 个节点同时探测拖垮内核。
+- **延迟劣化判定**：当前节点延迟超过近期基线 `DegradationRatio` 倍且连续 `DegradationThreshold` 次，即使未超时也触发切换，捕捉「能通但慢」的劣化节点。
+- **全池失败熔断**：候选池单轮失败率超过 `PoolFailureRateThreshold` 时作废本轮、不推进状态，避免探测目标本身故障被误判为全部节点故障。
+- **多 URL 轮询**：`ProbeUrls` 列表按轮次轮换探测目标，规避单一探测 URL 被墙或 DNS 污染导致的单点误判。
 
 ## 架构
 
@@ -25,6 +29,15 @@
 | `scripts/build-plugin.js` | 零第三方依赖的内联构建脚本 |
 | `plugins/gfs.json` | Plugin-Hub 元数据 |
 | `plugins/GFS/plugin-singbox-resilient-node-switcher.js` | 构建生成的自包含单文件插件 |
+
+### 双通道架构
+
+| 通道 | 节奏 | 探测对象 | 职责 |
+| --- | --- | --- | --- |
+| 通道 A · 快探 | 每 `WatchIntervalMs` | 仅当前节点 `now` | 连续失败或延迟劣化达阈值 → 触发切换三段式 |
+| 通道 B · 候选池 | 每 `PoolRefreshIntervalMs` | 除当前节点与 URLTest 外的全部成员 | 并发受限（`PoolConcurrency`）扫描，产出健康候选池 `candidates` |
+
+切换三段式：候选探测成功 → `PUT /proxies/{selector}` 切换 → 刷新 `/proxies` 确认 `now` 指向目标节点，任一环节失败都记错误、不重试、等下一轮重新判定。切换成功后对被切走节点执行 `markCooldown`（进入冷却，`InitialCooldownMs` 内不重新成为候选），并设最短驻留 `MinDwellMs` 防止乒乓。
 
 ## 安装
 
