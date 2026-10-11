@@ -41,3 +41,26 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
   const capped = normalizeConfig({ maxCooldownMs: 1, initialCooldownMs: 5000 });
   assert.ok(capped.maxCooldownMs >= capped.initialCooldownMs);
 });
+
+test('并发和阈值配置只接受正整数', () => {
+  const integerKeys = ['concurrency', 'failureThreshold', 'recoveryThreshold'];
+  const invalidValues = [0, -1, 1.5, 0.999, NaN, Infinity, '3'];
+
+  for (const key of integerKeys) {
+    for (const value of invalidValues) {
+      const config = normalizeConfig({ [key]: value });
+      assert.equal(config[key], DEFAULT_CONFIG[key], `${key} 应拒绝 ${String(value)}`);
+      assert.ok(Number.isInteger(config[key]));
+      assert.ok(config[key] > 0);
+    }
+  }
+
+  const valid = normalizeConfig({
+    concurrency: 1,
+    failureThreshold: 2,
+    recoveryThreshold: 7,
+  });
+  assert.equal(valid.concurrency, 1);
+  assert.equal(valid.failureThreshold, 2);
+  assert.equal(valid.recoveryThreshold, 7);
+});

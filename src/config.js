@@ -13,15 +13,22 @@ export const DEFAULT_CONFIG = Object.freeze({
 const POSITIVE_KEYS = [
   'intervalMs',
   'timeoutMs',
-  'concurrency',
-  'failureThreshold',
-  'recoveryThreshold',
   'initialCooldownMs',
   'minDwellMs',
 ];
 
+const POSITIVE_INTEGER_KEYS = [
+  'concurrency',
+  'failureThreshold',
+  'recoveryThreshold',
+];
+
 function positiveNumber(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function positiveInteger(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 export function normalizeConfig(input = {}) {
@@ -30,6 +37,10 @@ export function normalizeConfig(input = {}) {
 
   for (const key of POSITIVE_KEYS) {
     config[key] = positiveNumber(source[key], DEFAULT_CONFIG[key]);
+  }
+
+  for (const key of POSITIVE_INTEGER_KEYS) {
+    config[key] = positiveInteger(source[key], DEFAULT_CONFIG[key]);
   }
 
   config.maxCooldownMs = positiveNumber(source.maxCooldownMs, DEFAULT_CONFIG.maxCooldownMs);

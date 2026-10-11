@@ -69,11 +69,12 @@
 
 ## Task 5: GFS 插件适配与元数据
 
-**Files:** `plugins/GFS/plugin-singbox-resilient-node-switcher.js`, `plugins/gfs.json`, `test/plugin-source.test.js`, `README.md`
+**Files:** `plugins/GFS/plugin-singbox-resilient-node-switcher.js`, `plugins/gfs.json`, `scripts/build-plugin.js`, `test/plugin-source.test.js`, `README.md`
 
-- [ ] 写测试：源码可解析；元数据 ID/path/triggers/configuration 齐全；源码没有 `APP_TITLE`、`advancedConfig`、`providers/proxies`、配置写回或节点删除；现有插件路径不被引用。
+- [ ] 写测试：源码可解析；元数据 ID/path/triggers/configuration 齐全；源码没有 `APP_TITLE`、`advancedConfig`、`providers/proxies`、配置写回或节点删除；现有插件路径不被引用；GUI 插件单文件可独立解析且不导入项目 `src/`。
 - [ ] 运行 `node --test test/plugin-source.test.js`，确认因文件不存在而失败。
-- [ ] 实现默认导出工厂和生命周期：`onRun`、`onCoreStarted`、`onCoreStopped`、`onShutdown`、`onDispose`、`onUninstall` 及停止菜单；从当前 profile 解析 API；状态写入 GUI data；UI 展示当前节点、状态、延迟、错误和冷却截止时间。
+- [ ] 实现默认导出工厂和生命周期：`onRun`、`onCoreStarted`、`onCoreStopped`、`onShutdown`、`onDispose`、`onUninstall` 及停止菜单；从当前 profile 解析 API；状态写入 GUI data；UI 展示当前节点、状态、延迟、错误和冷却截止时间。GUI 可安装插件必须自包含全部运行逻辑，不通过相对路径或运行时导入项目 `src/`；用零第三方依赖的 `scripts/build-plugin.js` 从 `src/` 生成可审计内联单文件，或明确维护等价内联实现。
+- [ ] 构建/一致性验证：测试插件可独立语法解析、无项目模块导入，并校验生成插件中的公共默认配置与 `src/config.js` 保持一致；构建输出不得修改现有用户插件。
 - [ ] 重跑 `node --test test/plugin-source.test.js && node --test`，确认通过；提交 `feat: add GUI for SingBox resilient node switcher`。
 
 ## Task 6: 集成契约、文档与最终验证
