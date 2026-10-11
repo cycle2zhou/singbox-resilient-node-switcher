@@ -452,38 +452,56 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
   };
 }
 
-// 真实延迟探测：用 fetch 走系统代理（WebView 默认走系统代理，指向 sing-box 混合入站
-// 127.0.0.1:20122）发起真实 GET 并读取响应体，测到的是「用户实际访问延迟」。
-// 与 sing-box 的 /delay（HEAD + 不读 body，系统性低估 3~6 倍）互补，用于慢判定。
-// 返回 { ok, delay, status, reason }；ok=false 表示真实访问失败或超时。
-async function realProbe(url, timeoutMs, fetchImpl = globalThis.fetch) {
-  if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
-  const controller = new AbortController();
-  const timer = setTimeout(() => {
-    controller.abort(new DOMException('The operation timed out', 'TimeoutError'));
-  }, timeoutMs);
+// 软超时包装：给一个 Promise 加上超时上限，超时后返回 TimeoutError。
+// 底层 promise 在超时后仍会继续（无法取消 native 请求），但其结果会被忽略，
+// 避免 unhandledRejection。用于 HttpGet 等无显式超时参数的 native 请求。
+function withTimeout(promise, timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new DOMException('The operation timed out', 'TimeoutError'));
+      }
+    }, timeoutMs);
+    promise.then(
+      (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } },
+      (e) => { if (!settled) { settled = true; clearTimeout(timer); reject(e); } },
+    );
+  });
+}
+
+function isTimeoutError(error) {
+  if (!error) return false;
+  return error?.name === 'TimeoutError' || error?.name === 'AbortError'
+    || /timed?\s*out|timeout/i.test(error?.message || '');
+}
+
+// 真实延迟探测：通过注入的 httpGetImpl（GFS 插件传 Plugins.HttpGet，native 层无 CORS，
+// 默认走系统代理指向 sing-box 混合入站 127.0.0.1:20122）发起真实 GET 并完整下载响应体，
+// 测到的是「用户实际访问延迟」。与 sing-box 的 /delay（HEAD + 不读 body，系统性低估 3~6 倍）
+// 互补，用于慢判定。
+// httpGetImpl 签名：async (url) => ({ body })，body 为解析后的 JSON 对象或文本字符串；
+// 失败时抛异常（网络错误/超时/非 2xx），或返回 { body: { message, ... } }（GitHub API 风格错误）。
+// 返回 { ok, delay, reason }；ok=false 表示真实访问失败或超时。
+async function realProbe(url, timeoutMs, httpGetImpl) {
+  if (typeof httpGetImpl !== 'function') throw new TypeError('httpGetImpl must be a function');
   const start = Date.now();
   try {
-    const response = await fetchImpl(url, {
-      signal: controller.signal,
-      method: 'GET',
-      redirect: 'follow',
-      cache: 'no-store',
-    });
-    // 读完整响应体：真实访问会下载 body，这才能真正反映用户感知的延迟
-    await response.text();
+    const result = await withTimeout(httpGetImpl(url), timeoutMs);
     const delay = Date.now() - start;
-    if (!response.ok) {
-      return { ok: false, status: response.status, reason: `request failed with HTTP ${response.status}` };
+    const body = result && result.body;
+    // GitHub API 风格错误：body 是对象且含 message（如 rate limit/404）
+    if (body && typeof body === 'object' && !Array.isArray(body) && body.message) {
+      return { ok: false, reason: String(body.message) };
     }
     return { ok: true, delay };
   } catch (error) {
-    const reason = error?.name === 'AbortError' || error?.name === 'TimeoutError'
+    const reason = isTimeoutError(error)
       ? 'request timeout'
       : (error?.message || String(error));
     return { ok: false, reason };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -515,7 +533,7 @@ function stableKey(tag) {
   return m ? m[1].trim() : tag;
 }
 
-function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetch }) {
+function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
   const cfg = normalizeConfig(config);
   const time = clock && typeof clock.now === 'function' ? clock : Date;
   const log = logger && typeof logger.info === 'function' ? logger : silentLogger();
@@ -590,7 +608,7 @@ function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetc
     return { ok: false, result: last };
   }
 
-  // 真实延迟多 URL 探测：依次用 fetch 走系统代理发起真实 GET 并读 body。
+  // 真实延迟多 URL 探测：依次用 httpGetImpl（native 层，走系统代理）发起真实 GET 并读 body。
   // 至少一个 URL 真实访问成功即返回「最慢延迟」（用户感知的是最慢的站点）；
   // 全部失败才返回失败（视为「HEAD 通但 GET 不通」的盲区）。
   async function realProbeAny(urls, timeoutMs) {
@@ -601,7 +619,7 @@ function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetc
     for (const url of urls) {
       let result;
       try {
-        result = await realProbe(url, timeoutMs, fetchImpl);
+        result = await realProbe(url, timeoutMs, httpGetImpl);
       } catch (error) {
         result = { ok: false, reason: error?.message || String(error) };
       }
@@ -866,7 +884,7 @@ function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetc
         }
 
         // 真实延迟探测：sing-box 的 /delay 用 HEAD 不读 body，系统性低估真实 GET 延迟，
-        // 用 fetch 走系统代理测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
+        // 用 httpGetImpl（native 层 HttpGet，走系统代理）测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
         if (cfg.realProbeEnabled) {
           const realResult = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
           if (realResult.ok && realResult.result) {
@@ -1215,6 +1233,8 @@ export default (Plugin) => {
       api: apiClient,
       config,
       clock: Date,
+      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）
+      httpGetImpl: (url) => Plugins.HttpGet(url),
       logger: {
         info: (...args) => console.log(`[${Plugin.name}]`, ...args),
         warn: (...args) => console.warn(`[${Plugin.name}]`, ...args),

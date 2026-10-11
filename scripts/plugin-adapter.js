@@ -122,6 +122,8 @@ export default (Plugin) => {
       api: apiClient,
       config,
       clock: Date,
+      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）
+      httpGetImpl: (url) => Plugins.HttpGet(url),
       logger: {
         info: (...args) => console.log(`[${Plugin.name}]`, ...args),
         warn: (...args) => console.warn(`[${Plugin.name}]`, ...args),

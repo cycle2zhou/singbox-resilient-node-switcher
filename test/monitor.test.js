@@ -771,10 +771,10 @@ test('真实延迟探测：真实 GET 延迟超过 realDelayMs 触发切换（si
     select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
   });
 
-  // 真实延迟探测：mock fetch 真等 50ms（> realDelayMs=30），模拟真实 GET 慢
-  const fetchImpl = async () => {
+  // 真实延迟探测：mock httpGetImpl 真等 50ms（> realDelayMs=30），模拟真实 GET 慢
+  const httpGetImpl = async () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
-    return { status: 200, ok: true, async text() { return 'ok'; } };
+    return { body: 'ok' };
   };
 
   const clock = makeClock(0);
@@ -783,7 +783,7 @@ test('真实延迟探测：真实 GET 延迟超过 realDelayMs 触发切换（si
     config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 30, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
     clock,
     logger: makeLogger(),
-    fetchImpl,
+    httpGetImpl,
   });
 
   await monitor.poolCycle();
@@ -811,9 +811,9 @@ test('真实延迟探测：真实 GET 延迟未超过 realDelayMs 不触发切�
   });
 
   // 真实延迟 20ms < realDelayMs=100，不触发慢判定
-  const fetchImpl = async () => {
+  const httpGetImpl = async () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
-    return { status: 200, ok: true, async text() { return 'ok'; } };
+    return { body: 'ok' };
   };
 
   const clock = makeClock(0);
@@ -822,7 +822,7 @@ test('真实延迟探测：真实 GET 延迟未超过 realDelayMs 不触发切�
     config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 100, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
     clock,
     logger: makeLogger(),
-    fetchImpl,
+    httpGetImpl,
   });
 
   await monitor.poolCycle();
@@ -849,7 +849,7 @@ test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测
   });
 
   // 真实访问全部失败：抛网络错误
-  const fetchImpl = async () => { throw new Error('network unreachable'); };
+  const httpGetImpl = async () => { throw new Error('network unreachable'); };
 
   const clock = makeClock(0);
   const monitor = createMonitor({
@@ -857,7 +857,7 @@ test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测
     config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 30, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
     clock,
     logger: makeLogger(),
-    fetchImpl,
+    httpGetImpl,
   });
 
   await monitor.poolCycle();

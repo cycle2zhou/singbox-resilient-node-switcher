@@ -185,36 +185,36 @@ test('探测超时交给 sing-box timeout 参数，fetch 端兜底超时不提�
   assert.doesNotMatch(result.reason, /timeout|abort/i);
 });
 
-test('realProbe 真实 GET 读 body 并返回完整延迟', async () => {
-  // 真实延迟探测走系统代理发起 GET 并读完整响应体，延迟应反映完整下载时间
-  let startedAt = 0;
-  const fetchImpl = async (url, options) => {
-    startedAt = Date.now();
+test('realProbe 用 httpGetImpl 真实下载 body 并返回完整延迟', async () => {
+  // httpGetImpl（HttpGet 风格）真实下载响应体，延迟应反映完整下载时间
+  const httpGetImpl = async (url) => {
     assert.equal(url, 'https://github.com');
-    assert.equal(options.method, 'GET');
     await new Promise((resolve) => setTimeout(resolve, 30));
-    return response(200, 'ok');
+    return { body: '<html>ok</html>' };
   };
-  const result = await realProbe('https://github.com', 1000, fetchImpl);
+  const result = await realProbe('https://github.com', 1000, httpGetImpl);
   assert.equal(result.ok, true);
   assert.ok(result.delay >= 25 && result.delay < 200, `delay 应反映下载耗时，实际 ${result.delay}`);
 });
 
-test('realProbe 非 2xx 返回失败并附带 HTTP 状态', async () => {
-  const fetchImpl = async () => response(504, { error: 'unavailable' });
-  const result = await realProbe('https://github.com', 1000, fetchImpl);
+test('realProbe body 含 message（GitHub API 错误）返回失败', async () => {
+  const httpGetImpl = async () => ({ body: { message: 'API rate limit exceeded' } });
+  const result = await realProbe('https://github.com', 1000, httpGetImpl);
   assert.equal(result.ok, false);
-  assert.equal(result.status, 504);
-  assert.match(result.reason, /504/);
+  assert.match(result.reason, /rate limit/);
 });
 
-test('realProbe 超时抛 AbortError 归类为 request timeout', async () => {
-  const fetchImpl = async (_url, options) => new Promise((_resolve, reject) => {
-    options.signal.addEventListener('abort', () => {
-      reject(new DOMException('The operation was aborted', 'AbortError'));
-    });
-  });
-  const result = await realProbe('https://github.com', 20, fetchImpl);
+test('realProbe 网络错误抛异常返回失败', async () => {
+  const httpGetImpl = async () => { throw new Error('network unreachable'); };
+  const result = await realProbe('https://github.com', 1000, httpGetImpl);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /network unreachable/);
+});
+
+test('realProbe 超时归类为 request timeout', async () => {
+  // httpGetImpl 无超时参数，realProbe 用软超时兜底
+  const httpGetImpl = async () => new Promise((resolve) => setTimeout(() => resolve({ body: 'ok' }), 100));
+  const result = await realProbe('https://github.com', 20, httpGetImpl);
   assert.equal(result.ok, false);
   assert.match(result.reason, /timeout/i);
   assert.doesNotMatch(result.reason, /abort/i);

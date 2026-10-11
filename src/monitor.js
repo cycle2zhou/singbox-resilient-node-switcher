@@ -33,7 +33,7 @@ function stableKey(tag) {
   return m ? m[1].trim() : tag;
 }
 
-export function createMonitor({ api, config, clock, logger, fetchImpl = globalThis.fetch }) {
+export function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
   const cfg = normalizeConfig(config);
   const time = clock && typeof clock.now === 'function' ? clock : Date;
   const log = logger && typeof logger.info === 'function' ? logger : silentLogger();
@@ -108,7 +108,7 @@ export function createMonitor({ api, config, clock, logger, fetchImpl = globalTh
     return { ok: false, result: last };
   }
 
-  // 真实延迟多 URL 探测：依次用 fetch 走系统代理发起真实 GET 并读 body。
+  // 真实延迟多 URL 探测：依次用 httpGetImpl（native 层，走系统代理）发起真实 GET 并读 body。
   // 至少一个 URL 真实访问成功即返回「最慢延迟」（用户感知的是最慢的站点）；
   // 全部失败才返回失败（视为「HEAD 通但 GET 不通」的盲区）。
   async function realProbeAny(urls, timeoutMs) {
@@ -119,7 +119,7 @@ export function createMonitor({ api, config, clock, logger, fetchImpl = globalTh
     for (const url of urls) {
       let result;
       try {
-        result = await realProbe(url, timeoutMs, fetchImpl);
+        result = await realProbe(url, timeoutMs, httpGetImpl);
       } catch (error) {
         result = { ok: false, reason: error?.message || String(error) };
       }
@@ -384,7 +384,7 @@ export function createMonitor({ api, config, clock, logger, fetchImpl = globalTh
         }
 
         // 真实延迟探测：sing-box 的 /delay 用 HEAD 不读 body，系统性低估真实 GET 延迟，
-        // 用 fetch 走系统代理测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
+        // 用 httpGetImpl（native 层 HttpGet，走系统代理）测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
         if (cfg.realProbeEnabled) {
           const realResult = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
           if (realResult.ok && realResult.result) {
