@@ -400,7 +400,9 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
     async probe(node, url, timeoutMs, signal) {
       const encodedNode = encodeURIComponent(node);
       const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
-      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs);
+      // 探测超时交给 sing-box 的 timeout 参数（超时返回 504）；fetch 端仅保留兜底超时，
+      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）
+      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 10);
       if (!result.ok) return result;
       return parseDelayResponse(result.status, result.body);
     },

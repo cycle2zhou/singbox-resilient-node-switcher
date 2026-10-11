@@ -166,3 +166,21 @@ test('真实 fetch 超时抛 AbortError 时仍归类为 request timeout', async 
   assert.match(result.reason, /timeout/i);
   assert.doesNotMatch(result.reason, /abort/i);
 });
+
+test('探测超时交给 sing-box timeout 参数，fetch 端兜底超时不提前 abort', async () => {
+  // 回归保护：死节点由 sing-box 的 timeout 参数在 timeoutMs 后返回 504 判定，
+  // 而非 fetch 端在 timeoutMs 时 abort。fetch 端只保留 timeoutMs*10 的兜底超时，
+  // 避免 WKWebView 连接池排队期间活节点被短超时误 abort。
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason));
+      // 模拟 sing-box 在 timeoutMs(50ms) 之后才返回 504（而非立即挂起）
+      setTimeout(() => resolve(response(504, { error: 'unavailable' })), 120);
+    }),
+  });
+  const result = await api.probe('node', 'https://example.test', 50);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /504/);
+  assert.doesNotMatch(result.reason, /timeout|abort/i);
+});
