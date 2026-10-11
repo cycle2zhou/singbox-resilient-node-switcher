@@ -1,23 +1,89 @@
 # singbox-resilient-node-switcher
 
-面向 GUI.for.SingBox 的可恢复节点切换插件项目。
+面向 GUI.for.SingBox 的可恢复 Selector 节点切换插件：监控主选择组 `🚀 节点选择` 的全部直接成员，对故障节点执行「连续失败 → 冷却 → 半开探测 → 恢复」的可恢复退避，并在当前节点故障时谨慎切换到可用候选。
 
-## 当前状态
+## 特性
 
-Task 1 已完成项目骨架与公共模型：
+- **只读探测**：仅通过 sing-box Clash API 的 `/proxies`、`/proxies/{name}/delay` 与 `PUT /proxies/{selector}` 工作，不改写生成配置、不删除节点、不按 IP:端口合并节点。
+- **可恢复冷却**：故障节点进入指数退避冷却，到期后半开探测，连续成功才回到健康，不会被永久剔除。
+- **三段式切换确认**：候选探测成功 → PUT 切换 → 刷新确认 `now`，任一环节失败都不会误报切换成功。
+- **外部变化防抖**：用户手动切换 `now` 后，插件不会立即把节点切回旧节点。
 
-- `src/config.js`：默认配置与安全归一化；
-- `src/model.js`：节点健康状态创建与可持久化序列化；
-- `test/`：使用 Node.js 内置测试运行器的公共模型测试。
+## 架构
 
-## 默认配置
+核心逻辑与 GUI 完全解耦，插件适配层负责生命周期与状态展示：
 
-默认主 Selector 为 `🚀 节点选择`，检查间隔 30 秒、单节点超时 5 秒、并发上限 3；连续失败阈值为 3，恢复阈值为 2，初始冷却 120 秒，最大冷却 1800 秒，最短驻留 60 秒。
+| 文件 | 职责 |
+| --- | --- |
+| `src/config.js` | 默认配置与安全归一化 |
+| `src/model.js` | 节点健康状态创建与可持久化序列化 |
+| `src/response.js` | 延迟探测响应解析（正数 delay 才算成功） |
+| `src/health-state.js` | 可恢复健康状态机（纯时间参数，无系统时钟依赖） |
+| `src/api.js` | sing-box Clash API 客户端（超时/取消/错误模型） |
+| `src/monitor.js` | Selector 监控、并发受限探测与切换确认 |
+| `scripts/plugin-adapter.js` | GUI.for.SingBox 插件胶水（生命周期、配置、状态 UI） |
+| `scripts/build-plugin.js` | 零第三方依赖的内联构建脚本 |
+| `plugins/gfs.json` | Plugin-Hub 元数据 |
+| `plugins/GFS/plugin-singbox-resilient-node-switcher.js` | 构建生成的自包含单文件插件 |
 
-后续实现将仅使用 sing-box Clash API 进行主动探测和 Selector 切换，不修改生成配置、节点列表或现有用户插件。主动探测结果不等同于所有真实业务请求均已恢复；嵌套 URLTest 仍由 sing-box 核心管理。
+## 安装
+
+1. 构建自包含插件单文件：
+
+   ```sh
+   node scripts/build-plugin.js
+   ```
+
+2. 将 `plugins/GFS/plugin-singbox-resilient-node-switcher.js` 与 `plugins/gfs.json` 一起安装到 GUI.for.SingBox（放入插件目录，或经 Plugin-Hub 安装）。
+
+生成的插件单文件内联了全部运行逻辑，不通过相对路径或运行时 `import()` 引用项目 `src/`，可脱离本仓库独立运行。
+
+## 配置
+
+| 配置项 | 键 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| 主 Selector 名称 | `SelectorName` | `🚀 节点选择` | 需要监控并切换的主策略组 |
+| 检测间隔(ms) | `IntervalMs` | `30000` | 监控轮次的间隔 |
+| 探测超时(ms) | `TimeoutMs` | `5000` | 单次节点延迟探测的超时 |
+| 并发上限 | `Concurrency` | `3` | 同一轮次同时探测的最大节点数 |
+| 失败阈值 | `FailureThreshold` | `3` | 连续失败多少次后进入冷却 |
+| 恢复阈值 | `RecoveryThreshold` | `2` | 半开状态下连续成功多少次后恢复健康 |
+| 初始冷却(ms) | `InitialCooldownMs` | `120000` | 首次进入冷却的时长 |
+| 最大冷却(ms) | `MaxCooldownMs` | `1800000` | 指数退避的冷却上限 |
+| 最短驻留(ms) | `MinDwellMs` | `60000` | 切换后至少驻留该时长才允许再次切换 |
+| 探测 URL | `ProbeUrl` | `https://www.gstatic.com/generate_204` | 节点延迟探测的目标地址 |
+
+## 状态机
+
+```
+healthy ──连续失败──▶ suspect ──失败达阈值(3)──▶ cooldown
+   ▲                                                  │
+   │ 半开连续成功达恢复阈值(2)                          │ 冷却到期（指数退避，120s 起、1800s 封顶）
+   │                                                  ▼
+   └────────────────────────────── half-open ◀────────┘
+```
+
+- 单次失败只累计，不立即冷却；
+- 半开探测失败会回到冷却，冷却时长按 2 倍退避且不超过 `MaxCooldownMs`；
+- 只有 `healthy` 与 `suspect` 状态的节点可作为切换候选。
+
+## 限制
+
+- 只支持 GUI.for.SingBox，不支持 GUI.for.Clash 或其他内核分支。
+- 不接管 URLTest：嵌套 `🎈 自动选择` 只作为主 Selector 的成员处理，不展开其内部节点，仍由 sing-box 核心管理。
+- 不调用 provider healthcheck。
+- 主动探测结果仅代表探测请求本身成功，不等于所有真实业务请求均已恢复。
+
+## 停止与回滚
+
+- 右键菜单「停止」可停止监控与切换。
+- 插件卸载会触发 `onUninstall` 清理 data 目录；`onCoreStopped`、`onShutdown`、`onDispose` 会清理定时器、进行中的请求与状态 UI。
+- 卸载本插件不会改动 sing-box 配置或现有节点列表。
 
 ## 测试
 
 ```sh
 npm test
 ```
+
+使用 Node.js 内置测试运行器，覆盖配置归一化、响应解析、API 超时/错误模型、健康状态机、监控切换与插件源码审计边界。契约测试 `test/integration-contract.test.js` 校验元数据与文件路径一致、默认值一致，以及 README 中的关键限制说明。

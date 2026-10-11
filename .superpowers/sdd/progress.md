@@ -9,3 +9,5 @@ Task 3: complete (node --test -> 23/23 pass; health-state.js 状态机 healthy/s
 Task 4: complete (node --test -> 30/30 pass; monitor.js 同步all/now+URLTest不展开+并发受限探测+三段式切换确认+外部变化防抖)
 
 Task 5: complete (node --test -> 38/38 pass; plugin-adapter.js GFS 胶水 + build-plugin.js 零依赖内联 + gfs.json 元数据 + 单文件插件 27311B + plugin-source.test.js 7 审计测试; probeUrl 归一化缺失已修复)
+
+Task 6: complete (node --test -> 42/42 pass; openspec validate --all --json -> valid; README 安装/配置/状态机/限制/回滚 + integration-contract.test.js 4 契约测试)
