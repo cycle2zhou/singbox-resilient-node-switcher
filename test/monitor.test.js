@@ -75,8 +75,11 @@ test('通道 B 同步成员、跳过 URLTest 与当前 now、按成员顺序产�
   assert.deepEqual([...snap.members].sort(), ['node-a', 'node-b', '🎈 自动选择']);
   assert.equal(snap.memberTypes['🎈 自动选择'], 'URLTest');
   assert.equal(snap.memberTypes['inner-1'], undefined);
-  // 只探测 node-b（跳过当前 now node-a 与 URLTest），candidates 按成员顺序
-  assert.deepEqual(probed, ['node-b']);
+  // 只探测 node-b（跳过当前 now node-a 与 URLTest）；并行短路下 node-b 同时探测全部 URL
+  assert.ok(
+    probed.length === DEFAULT_CONFIG.probeUrls.length && probed.every((n) => n === 'node-b'),
+    `只探测 node-b（并行探测全部 ${DEFAULT_CONFIG.probeUrls.length} 个 URL）`,
+  );
   assert.deepEqual(snap.candidates, ['node-b']);
 });
 
@@ -102,8 +105,12 @@ test('通道 B 并发峰值不超过 poolConcurrency 且跳过当前 now', async
   const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
   await monitor.poolCycle();
 
-  assert.ok(maxActive <= fastConfig.poolConcurrency, `并发峰值 ${maxActive} 应不超过 ${fastConfig.poolConcurrency}`);
-  assert.equal(probeCount, tags.length - 1);
+  // 并行短路下每个节点同时探测全部 URL，故并发上界与探测次数都乘以 URL 数
+  assert.ok(
+    maxActive <= fastConfig.poolConcurrency * DEFAULT_CONFIG.probeUrls.length,
+    `并发峰值 ${maxActive} 应不超过 poolConcurrency×URL数 ${fastConfig.poolConcurrency * DEFAULT_CONFIG.probeUrls.length}`,
+  );
+  assert.equal(probeCount, (tags.length - 1) * DEFAULT_CONFIG.probeUrls.length);
 });
 
 test('主 Selector 缺失、类型非 Selector 或空成员时停止并报告原因', async () => {
@@ -274,30 +281,24 @@ test('通道 B 全池失败率超过阈值时本轮作废、不推进状态', as
   assert.match(snap2.lastError, /熔断|全池|失败率/);
 });
 
-test('通道 A 快探按轮次轮换起始探测 URL（短路多 URL）', async () => {
+test('通道 A 并行短路多 URL：一轮同时探测全部 URL，任一成功即返回', async () => {
   const proxies = () => selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
 
-  const probedUrls = [];
+  const probedUrls = new Set();
   const api = makeApi({
     getProxies: async () => ({ proxies: proxies() }),
     probe: async (node, url) => {
-      if (node === 'n0') probedUrls.push(url);
+      if (node === 'n0') probedUrls.add(url);
       return { ok: true, delay: 1 };
     },
   });
 
   const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
 
-  for (let i = 0; i < 3; i += 1) {
-    await monitor.watchCycle();
-  }
+  await monitor.watchCycle();
 
-  // mock 全部成功，短路探测每轮只探序列首个 URL，验证起始位轮换
-  assert.deepEqual(probedUrls, [
-    DEFAULT_CONFIG.probeUrls[0],
-    DEFAULT_CONFIG.probeUrls[1],
-    DEFAULT_CONFIG.probeUrls[2],
-  ]);
+  // 并行短路：一轮即探测全部 URL（而非串行只探首个），任一成功即返回
+  assert.deepEqual([...probedUrls].sort(), [...DEFAULT_CONFIG.probeUrls].sort());
 });
 
 test('通道 B 短路多 URL：对 gstatic/google 不可达但 github 可达的节点进入候选池', async () => {

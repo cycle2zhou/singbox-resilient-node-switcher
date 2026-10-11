@@ -79,10 +79,10 @@
     {
       "id": "ID_pool_timeout_ms",
       "title": "候选池探测超时(ms)",
-      "description": "候选池单节点探测超时，默认 5000",
+      "description": "候选池单节点探测超时，默认 2000",
       "key": "PoolTimeoutMs",
       "component": "Input",
-      "value": "5000",
+      "value": "2000",
       "options": []
     },
     {

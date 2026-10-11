@@ -15,7 +15,7 @@ test('normalizeConfig({}) 返回规格中的 28 项默认配置', () => {
   assert.equal(config.watchTimeoutMs, 4000);
   assert.equal(config.maxDelayMs, 2000);
   assert.equal(config.poolRefreshIntervalMs, 180000);
-  assert.equal(config.poolTimeoutMs, 5000);
+  assert.equal(config.poolTimeoutMs, 2000);
   assert.equal(config.poolConcurrency, 20);
   assert.equal(config.poolFailureRateThreshold, 0.9);
   assert.equal(config.failureThreshold, 3);

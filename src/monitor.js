@@ -91,21 +91,31 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     return sequence;
   }
 
-  // 短路多 URL 探测：按顺序依次探测，任一 URL 成功即返回 ok；
-  // 全部失败则返回最后一个失败结果，交由调用方判定。
+  // 并行短路多 URL 探测：同时探测所有 URL，任一 URL 成功即返回 ok（取最快成功）；
+  // 全部失败则返回最后一个 URL 的失败结果，交由调用方判定。
+  // 相比串行依次探测，死节点（所有 URL 都超时）只需等单个 URL 超时而非逐个累加，
+  // 3 个 URL 时死节点探测耗时从 3×timeout 降为 1×timeout，大幅缩短冷启动全池扫描时间。
   async function probeAny(node, urls, timeoutMs, signal) {
-    let last = null;
-    for (const url of urls) {
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return { ok: false, result: null };
+    }
+    const probeOne = async (url) => {
       let result;
       try {
         result = await api.probe(node, url, timeoutMs, signal);
       } catch (error) {
         result = { ok: false, reason: error?.message || String(error) };
       }
-      if (result && result.ok) return { ok: true, result };
-      last = result;
+      if (result && result.ok) return result;
+      throw result || new Error('probe failed');
+    };
+    try {
+      const result = await Promise.any(urls.map(probeOne));
+      return { ok: true, result };
+    } catch (aggregate) {
+      const errors = Array.isArray(aggregate?.errors) ? aggregate.errors : [];
+      return { ok: false, result: errors[errors.length - 1] || { ok: false, reason: 'probe failed' } };
     }
-    return { ok: false, result: last };
   }
 
   // 真实延迟多 URL 探测：依次用 httpGetImpl（native 层，走系统代理）发起真实 GET 并读 body。

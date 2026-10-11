@@ -15,6 +15,7 @@
 - **全池失败熔断**：候选池单轮失败率超过 `PoolFailureRateThreshold` 时作废本轮、不推进状态，避免探测目标本身故障被误判为全部节点故障。
 - **多 URL 短路探测**：`ProbeUrls` 列表按轮次轮换起始位，对同一节点依次探测、任一 URL 可达即判健康，规避单一探测 URL 被墙或 DNS 污染导致的单点误判。
 - **性能择优**：当前节点延迟超过候选池最优节点 `OptimizeRatio` 倍且连续 `OptimizeThreshold` 次，即使仍可用也切到更低延迟节点，兼顾稳定与速度。
+- **候选池延迟排序与切换后验证回退**：候选池按探测延迟升序，切换恒选最快；切到候选后立即真实 GET 验证，真实失效/超慢则标记冷却并回退切下一个，避免「切到失效节点」导致断网。
 
 ## 架构
 
@@ -40,7 +41,7 @@
 | 通道 A · 快探 | 每 `WatchIntervalMs` | 仅当前节点 `now` | 连续失败或延迟劣化达阈值 → 触发切换三段式 |
 | 通道 B · 候选池 | 每 `PoolRefreshIntervalMs` | 除当前节点与 URLTest 外的全部成员 | 并发受限（`PoolConcurrency`）扫描，产出健康候选池 `candidates` |
 
-切换三段式：切换前先复核候选（最多 `PreSwitchMaxProbe` 个，跳过不可达者）→ `PUT /proxies/{selector}` 切换 → 刷新 `/proxies` 确认 `now` 指向目标节点，任一环节失败都记错误、不重试、等下一轮重新判定。切换成功后对被切走节点执行 `markCooldown`（进入冷却，`InitialCooldownMs` 内不重新成为候选），并设最短驻留 `MinDwellMs` 防止乒乓；随后进入盯梢期：`StalkProbeDelayMs` 后快探新节点，失败 1 次即快速切走（盯梢期免驻留），连续成功 `StalkSuccessThreshold` 次后退出盯梢、恢复正常阈值。
+切换三段式（候选已按延迟升序排序，恒切最快）：切换前**并行复核**候选（最多 `PreSwitchMaxProbe` 个，跳过不可达者）→ `PUT /proxies/{selector}` 切换 → 刷新 `/proxies` 确认 `now` 指向目标节点。确认后**立即真实验证**（若开启 `RealProbeEnabled`，真实 GET 读 body）：真实失效/超慢则标记该候选冷却、继续切下一个候选（循环最多 `PreSwitchMaxProbe` 次），避免「切到失效节点」陷入长判定等待。切换成功后对被切走节点执行 `markCooldown`（进入冷却，`InitialCooldownMs` 内不重新成为候选），并设最短驻留 `MinDwellMs` 防止乒乓；随后进入盯梢期：`StalkProbeDelayMs` 后快探新节点，失败 1 次即快速切走（盯梢期免驻留），连续成功 `StalkSuccessThreshold` 次后退出盯梢、恢复正常阈值。
 
 ## 安装
 
@@ -64,7 +65,7 @@
 | 快探超时(ms) | `WatchTimeoutMs` | `4000` | 当前节点单次快探的超时 |
 | 绝对延迟阈值(ms) | `MaxDelayMs` | `2000` | 探测成功但延迟超过该值即计「慢」，连续慢达标触发切换 |
 | 候选池刷新间隔(ms) | `PoolRefreshIntervalMs` | `180000` | 通道 B 候选池后台刷新的间隔 |
-| 候选池探测超时(ms) | `PoolTimeoutMs` | `5000` | 候选池单节点探测超时，需足够长以适配 WebView 环境下的排队探测 |
+| 候选池探测超时(ms) | `PoolTimeoutMs` | `2000` | 候选池单节点探测超时，死节点多 URL 并行短路探测，缩短冷启动全池扫描 |
 | 候选池并发 | `PoolConcurrency` | `20` | 候选池同批并发探测的最大节点数 |
 | 全池熔断阈值 | `PoolFailureRateThreshold` | `0.9` | 本轮失败率超过该阈值则作废本轮 |
 | 失败阈值 | `FailureThreshold` | `3` | 连续失败多少次后进入冷却 |

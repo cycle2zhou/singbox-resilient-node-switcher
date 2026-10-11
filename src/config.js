@@ -9,7 +9,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   watchTimeoutMs: 4000,
   maxDelayMs: 2000,
   poolRefreshIntervalMs: 180000,
-  poolTimeoutMs: 5000,
+  poolTimeoutMs: 2000,
   poolConcurrency: 20,
   poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
