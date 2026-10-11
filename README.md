@@ -86,6 +86,7 @@
 | 真实探测 URL 列表 | `RealProbeUrls` | `https://github.com,https://www.google.com` | 真实延迟探测目标地址，逗号分隔；全部探测取最慢延迟，至少一个成功才判健康 |
 | 真实延迟阈值(ms) | `RealDelayMs` | `3000` | 真实 GET 延迟超过该值即计「慢」 |
 | 真实探测超时(ms) | `RealProbeTimeoutMs` | `8000` | 单次真实 GET 探测的超时 |
+| 盯梢期真实探测超时(ms) | `RealStalkTimeoutMs` | `3000` | 切换后盯梢期（快速检测）的真实 GET 探测超时，更短以便尽快发现慢节点再切 |
 | 真实慢连续次数 | `RealSlowThreshold` | `1` | 真实 GET 连续多少次超阈值（或全部失败）后触发切换 |
 
 ## 状态机

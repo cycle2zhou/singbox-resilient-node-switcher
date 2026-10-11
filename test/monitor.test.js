@@ -1086,3 +1086,111 @@ test('候选复核并行：排序后第一个候选不可达，跳过切第二�
   assert.deepEqual(selected, ['n2'], 'n1 复核不可达应被跳过，切 n2');
   assert.equal(monitor.getSnapshot().currentNow, 'n2');
 });
+
+test('真实延迟探测：多 URL 并行（Promise.all）同时发起请求', async () => {
+  // realProbeAny 并行化后，多个 URL 应同时发起真实 GET，而非串行逐个
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0'], leafTypes(['n0']));
+
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  const httpGetImpl = async () => {
+    concurrent += 1;
+    maxConcurrent = Math.max(maxConcurrent, concurrent);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    concurrent -= 1;
+    return { body: 'ok' };
+  };
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }),
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://a.com', 'https://b.com', 'https://c.com'],
+      realDelayMs: 100,
+      realProbeTimeoutMs: 500,
+      realSlowThreshold: 1,
+    },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  await monitor.watchCycle();
+
+  assert.ok(maxConcurrent >= 2, `多 URL 应并行探测（峰值并发 ${maxConcurrent} >= 2）`);
+});
+
+test('盯梢期真实探测用更短超时：中等慢节点在短超时下被判失败再切', async () => {
+  // 切换后进入盯梢期（stalking=true），真实探测超时从 realProbeTimeoutMs 缩短到
+  // realStalkTimeoutMs，使「介于两者之间」的慢节点更快被判超时失败并触发再切换。
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') return { ok: false, reason: 'timeout' }; // n0 HEAD 失效，触发切换
+      return { ok: true, delay: 10 }; // n1/n2 HEAD 快
+    },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // 真实访问：n1 切换后验证时快（20ms），盯梢快探时慢（60ms）；n2 快（20ms）
+  let n1ProbeCount = 0;
+  const httpGetImpl = async () => {
+    if (currentNow === 'n1') {
+      n1ProbeCount += 1;
+      const delay = n1ProbeCount === 1 ? 20 : 60;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return { body: 'ok' };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { body: 'ok' };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      failureThreshold: 1,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://github.com'],
+      realDelayMs: 300,          // 60ms < 300，长超时下不算慢
+      realProbeTimeoutMs: 500,   // 长超时 500ms：60ms 成功且不慢
+      realStalkTimeoutMs: 30,    // 短超时 30ms：60ms 超时失败
+      realSlowThreshold: 1,
+    },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  // 第一轮：n0 HEAD 失效累积计数（dwell 未满足）；advance 后第二轮触发切换切 n1
+  await monitor.watchCycle();
+  clock.advance(1000);
+  await monitor.watchCycle();
+  clock.advance(1000);
+  assert.deepEqual(selected, ['n1'], 'n0 失效应切到 n1');
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+
+  // 第三轮（盯梢快探，stalking=true）：n1 真实 60ms > realStalkTimeoutMs=30 → 超时失败 → 触发再切 n2
+  await monitor.watchCycle();
+  clock.advance(1000);
+
+  assert.deepEqual(selected, ['n1', 'n2'], '盯梢期短超时下 n1 60ms 超时失效应触发再切 n2');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});

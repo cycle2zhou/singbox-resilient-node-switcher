@@ -36,6 +36,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   ]),
   realDelayMs: 3000,
   realProbeTimeoutMs: 8000,
+  // 盯梢期（切换后快速检测）真实探测用更短超时，尽快发现「切到的节点其实慢/不通」
+  realStalkTimeoutMs: 3000,
   realSlowThreshold: 1,
 });
 
@@ -52,6 +54,7 @@ const POSITIVE_KEYS = [
   'stalkProbeDelayMs',
   'realDelayMs',
   'realProbeTimeoutMs',
+  'realStalkTimeoutMs',
 ];
 
 const POSITIVE_INTEGER_KEYS = [

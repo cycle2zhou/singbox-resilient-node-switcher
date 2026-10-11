@@ -83,6 +83,7 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     RealProbeUrls: DEFAULT_CONFIG.realProbeUrls.join(','),
     RealDelayMs: String(DEFAULT_CONFIG.realDelayMs),
     RealProbeTimeoutMs: String(DEFAULT_CONFIG.realProbeTimeoutMs),
+    RealStalkTimeoutMs: String(DEFAULT_CONFIG.realStalkTimeoutMs),
     RealSlowThreshold: String(DEFAULT_CONFIG.realSlowThreshold),
   };
 
@@ -123,6 +124,7 @@ test('插件源码读取全部双通道配置键', () => {
     'Plugin.RealProbeUrls',
     'Plugin.RealDelayMs',
     'Plugin.RealProbeTimeoutMs',
+    'Plugin.RealStalkTimeoutMs',
     'Plugin.RealSlowThreshold',
   ];
   for (const key of keys) {

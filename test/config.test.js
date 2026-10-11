@@ -39,6 +39,7 @@ test('normalizeConfig({}) 返回规格中的 28 项默认配置', () => {
   ]);
   assert.equal(config.realDelayMs, 3000);
   assert.equal(config.realProbeTimeoutMs, 8000);
+  assert.equal(config.realStalkTimeoutMs, 3000);
   assert.equal(config.realSlowThreshold, 1);
   assert.deepEqual(config, DEFAULT_CONFIG);
 });
@@ -68,6 +69,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     preSwitchMaxProbe: 0,
     realDelayMs: -1,
     realProbeTimeoutMs: 0,
+    realStalkTimeoutMs: 0,
     realSlowThreshold: 0,
   });
 
@@ -84,6 +86,7 @@ test('normalizeConfig 安全归一化非法负数和零值', () => {
     'stalkProbeDelayMs',
     'realDelayMs',
     'realProbeTimeoutMs',
+    'realStalkTimeoutMs',
   ]) {
     assert.ok(config[key] > 0, `${key} 应为正数`);
   }

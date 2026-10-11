@@ -118,21 +118,24 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     }
   }
 
-  // 真实延迟多 URL 探测：依次用 httpGetImpl（native 层，走系统代理）发起真实 GET 并读 body。
+  // 真实延迟多 URL 探测：并行用 httpGetImpl（native 层，走系统代理）发起真实 GET 并读 body。
   // 至少一个 URL 真实访问成功即返回「最慢延迟」（用户感知的是最慢的站点）；
   // 全部失败才返回失败（视为「HEAD 通但 GET 不通」的盲区）。
   async function realProbeAny(urls, timeoutMs) {
     if (!Array.isArray(urls) || urls.length === 0) {
       return { ok: false, result: null };
     }
+    const results = await Promise.all(
+      urls.map(async (url) => {
+        try {
+          return await realProbe(url, timeoutMs, httpGetImpl);
+        } catch (error) {
+          return { ok: false, reason: error?.message || String(error) };
+        }
+      }),
+    );
     let slowest = null;
-    for (const url of urls) {
-      let result;
-      try {
-        result = await realProbe(url, timeoutMs, httpGetImpl);
-      } catch (error) {
-        result = { ok: false, reason: error?.message || String(error) };
-      }
+    for (const result of results) {
       if (result && result.ok && (slowest === null || result.delay > slowest.delay)) {
         slowest = result;
       }
@@ -400,7 +403,9 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         // 真实延迟探测：sing-box 的 /delay 用 HEAD 不读 body，系统性低估真实 GET 延迟，
         // 用 httpGetImpl（native 层 HttpGet，走系统代理）测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
         if (cfg.realProbeEnabled) {
-          const realResult = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
+          // 盯梢期内用更短超时，尽快发现「切到的节点其实慢/不通」并触发再切换
+          const realTimeout = stalking ? cfg.realStalkTimeoutMs : cfg.realProbeTimeoutMs;
+          const realResult = await realProbeAny(cfg.realProbeUrls, realTimeout);
           if (realResult.ok && realResult.result) {
             realDelay = realResult.result.delay;
             realSlowCount = realResult.result.delay > cfg.realDelayMs ? realSlowCount + 1 : 0;
