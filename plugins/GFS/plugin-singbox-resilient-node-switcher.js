@@ -755,10 +755,14 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
         }
       }
 
-      candidates = probeTargets.filter((tag) => {
-        const st = nodeStates.get(tag);
-        return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
-      });
+      // 候选池按 lastDelay 升序排序，candidates[0] 恒为当前最快节点，
+      // 使故障切换与择优切换统一切「最快」，复核也按「最快优先」探测
+      candidates = probeTargets
+        .filter((tag) => {
+          const st = nodeStates.get(tag);
+          return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
+        })
+        .sort((a, b) => (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity));
 
       return { skipped: false, error: null };
     } finally {
@@ -931,40 +935,109 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        // 切换前候选复核：探测候选，跳过当前不可达者，最多尝试 preSwitchMaxProbe 个
-        let target = null;
         // tag 漂移下，候选池可能残留「当前节点」的旧/新后缀快照，切换前按稳定身份排除
         candidates = candidates.filter((t) => stableKey(t) !== stableKey(observedNow));
-        const maxTry = Math.min(cfg.preSwitchMaxProbe, candidates.length);
-        for (let attempt = 0; attempt < maxTry; attempt += 1) {
-          const best = bestCandidate();
-          const candidate = optimizeTriggered && best ? best.tag : candidates[0];
-          const check = await probeAny(
-            candidate,
-            probeUrlSequence(watchCycleCount + attempt),
-            cfg.watchTimeoutMs,
-            cycleController.signal,
-          );
-          if (check.ok) {
-            target = candidate;
-            break;
+
+        // 循环切换：切到候选后立即真实验证，真实失效则排除该候选继续切下一个，
+        // 最多尝试 preSwitchMaxProbe 个候选，避免「切到失效节点」陷入长判定等待
+        let attempts = 0;
+        while (candidates.length > 0 && attempts < cfg.preSwitchMaxProbe) {
+          attempts += 1;
+
+          // 并行复核前 preSwitchMaxProbe 个候选（已按延迟升序），取最快可达者
+          const probePool = candidates.slice(0, cfg.preSwitchMaxProbe);
+          const checks = await Promise.all(probePool.map(async (candidate) => {
+            const check = await probeAny(
+              candidate,
+              probeUrlSequence(watchCycleCount + attempts - 1),
+              cfg.watchTimeoutMs,
+              cycleController.signal,
+            );
+            return { candidate, ok: check.ok };
+          }));
+          const unreachable = new Set(checks.filter((c) => !c.ok).map((c) => c.candidate));
+          const reachable = checks.filter((c) => c.ok).map((c) => c.candidate);
+          if (unreachable.size > 0) {
+            candidates = candidates.filter((t) => !unreachable.has(t));
+            for (const c of unreachable) log.warn(`候选 ${c} 复核不可达，跳过`);
           }
-          candidates = candidates.filter((t) => t !== candidate);
-          log.warn(`候选 ${candidate} 复核不可达，跳过`);
-        }
-        if (!target) {
-          lastError = '候选池内候选复核均不可达，等待通道 B 刷新';
-          log.warn(lastError);
-          return { skipped: false, switchedTo: null, error: lastError };
-        }
+          if (reachable.length === 0) {
+            lastError = '候选池内候选复核均不可达，等待通道 B 刷新';
+            log.warn(lastError);
+            return { skipped: false, switchedTo: null, error: lastError };
+          }
+          const target = reachable[0]; // probePool 已按延迟升序，第一个即最快可达
 
-        try {
-          await api.select(cfg.selectorName, target, cycleController.signal);
-        } catch (error) {
-          log.warn(`切换到 ${target} 失败`, error?.message || String(error));
-          lastError = `switch failed: ${error?.message}`;
+          // 切换
+          try {
+            await api.select(cfg.selectorName, target, cycleController.signal);
+          } catch (error) {
+            log.warn(`切换到 ${target} 失败`, error?.message || String(error));
+            lastError = `switch failed: ${error?.message}`;
+            currentStartAt = now;
+            // 切换失败可能由节点或控制面瞬时问题引起，重置计数避免 failureCount 累积卡死
+            watchFailureCount = 0;
+            watchDegradationCount = 0;
+            watchOptimizeCount = 0;
+            watchSlowCount = 0;
+            realSlowCount = 0;
+            realDelay = null;
+            return { skipped: false, switchedTo: null, error: lastError };
+          }
+
+          // 刷新确认 now
+          let confirmNow = null;
+          try {
+            const refreshed = await api.getProxies(cycleController.signal);
+            confirmNow = refreshed?.proxies?.[cfg.selectorName]?.now ?? null;
+          } catch (error) {
+            confirmNow = null;
+          }
+
+          if (confirmNow !== null && stableKey(confirmNow) === stableKey(target)) {
+            // 切换后立即真实验证：真实 GET 读 body，识别「探测通但真实失效/超慢」的节点
+            let realOk = true;
+            if (cfg.realProbeEnabled) {
+              const realCheck = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
+              realOk = realCheck.ok && realCheck.result && realCheck.result.delay <= cfg.realDelayMs;
+              if (!realOk) {
+                const realMs = realCheck.ok && realCheck.result ? realCheck.result.delay : null;
+                log.warn(`切换到 ${target} 后真实验证失败（真实延迟 ${realMs}ms），立即回退`);
+              }
+            }
+            if (!realOk) {
+              // 真实失效/超慢：标记 cooldown 排除该候选，继续循环切下一个
+              const targetState = ensureNodeState(target);
+              nodeStates.set(target, markCooldown(targetState, now, cfg));
+              candidates = candidates.filter((t) => stableKey(t) !== stableKey(target));
+              continue;
+            }
+
+            // 真实可用，正常进入盯梢期
+            const oldState = ensureNodeState(observedNow);
+            nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
+            lastSwitch = { from: observedNow, to: target, at: now };
+            currentNow = target;
+            lastObservedNow = target;
+            currentStartAt = now;
+            candidates = candidates.filter((t) => stableKey(t) !== stableKey(target) && stableKey(t) !== stableKey(observedNow));
+            watchBaseline = [];
+            watchFailureCount = 0;
+            watchDegradationCount = 0;
+            watchOptimizeCount = 0;
+            watchSlowCount = 0;
+            realSlowCount = 0;
+            realDelay = null;
+            stalking = true;
+            stalkingSuccessCount = 0;
+            scheduleStalkProbe();
+            log.info(`已切换到 ${target}`);
+            return { skipped: false, switchedTo: target, error: null };
+          }
+
+          log.warn(`切换确认失败：期望 now=${target} 实际 now=${confirmNow}`);
+          lastError = 'switch confirm failed';
           currentStartAt = now;
-          // 切换失败可能由节点或控制面瞬时问题引起，重置计数避免 failureCount 累积卡死
           watchFailureCount = 0;
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
@@ -974,45 +1047,9 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        let confirmNow = null;
-        try {
-          const refreshed = await api.getProxies(cycleController.signal);
-          confirmNow = refreshed?.proxies?.[cfg.selectorName]?.now ?? null;
-        } catch (error) {
-          confirmNow = null;
-        }
-
-        if (confirmNow !== null && stableKey(confirmNow) === stableKey(target)) {
-          const oldState = ensureNodeState(observedNow);
-          nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
-          lastSwitch = { from: observedNow, to: target, at: now };
-          currentNow = target;
-          lastObservedNow = target;
-          currentStartAt = now;
-          candidates = candidates.filter((t) => stableKey(t) !== stableKey(target) && stableKey(t) !== stableKey(observedNow));
-          watchBaseline = [];
-          watchFailureCount = 0;
-          watchDegradationCount = 0;
-          watchOptimizeCount = 0;
-          watchSlowCount = 0;
-          realSlowCount = 0;
-          realDelay = null;
-          stalking = true;
-          stalkingSuccessCount = 0;
-          scheduleStalkProbe();
-          log.info(`已切换到 ${target}`);
-          return { skipped: false, switchedTo: target, error: null };
-        }
-
-        log.warn(`切换确认失败：期望 now=${target} 实际 now=${confirmNow}`);
-        lastError = 'switch confirm failed';
-        currentStartAt = now;
-        watchFailureCount = 0;
-        watchDegradationCount = 0;
-        watchOptimizeCount = 0;
-        watchSlowCount = 0;
-        realSlowCount = 0;
-        realDelay = null;
+        // 循环耗尽：候选池内候选均真实失效或切换失败
+        lastError = '候选池内候选均切换失败，等待通道 B 刷新';
+        log.warn(lastError);
         return { skipped: false, switchedTo: null, error: lastError };
       }
 

@@ -771,9 +771,11 @@ test('真实延迟探测：真实 GET 延迟超过 realDelayMs 触发切换（si
     select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
   });
 
-  // 真实延迟探测：mock httpGetImpl 真等 50ms（> realDelayMs=30），模拟真实 GET 慢
+  // 真实延迟探测：mock httpGetImpl 真等 50ms（> realDelayMs=30），模拟真实 GET 慢。
+  // 切换后 currentNow 变为新节点，httpGetImpl 应模拟「新节点真实快」，避免切换后验证误判
   const httpGetImpl = async () => {
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const delay = currentNow === 'n0' ? 50 : 10;
+    await new Promise((resolve) => setTimeout(resolve, delay));
     return { body: 'ok' };
   };
 
@@ -812,9 +814,10 @@ test('真实延迟探测：sing-box 探测不慢（608ms）但真实访问超阈
     select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
   });
 
-  // 真实访问 150ms > realDelayMs=100
+  // 真实访问 150ms > realDelayMs=100；切换后新节点真实快，避免切换后验证误判
   const httpGetImpl = async () => {
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const delay = currentNow === 'n0' ? 150 : 10;
+    await new Promise((resolve) => setTimeout(resolve, delay));
     return { body: 'ok' };
   };
 
@@ -888,8 +891,11 @@ test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测
     select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
   });
 
-  // 真实访问全部失败：抛网络错误
-  const httpGetImpl = async () => { throw new Error('network unreachable'); };
+  // 真实访问全部失败：抛网络错误；切换后新节点真实可达
+  const httpGetImpl = async () => {
+    if (currentNow === 'n0') throw new Error('network unreachable');
+    return { body: 'ok' };
+  };
 
   const clock = makeClock(0);
   const monitor = createMonitor({
@@ -925,8 +931,10 @@ test('真实延迟探测：多 URL 取最慢延迟，快 URL 不掩盖慢 URL', 
     select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
   });
 
-  // github 慢 150ms（> realDelayMs=100），google 快 20ms；应取最慢的 github 150ms
+  // github 慢 150ms（> realDelayMs=100），google 快 20ms；应取最慢的 github 150ms。
+  // 切换后新节点真实快，避免切换后验证误判
   const httpGetImpl = async (url) => {
+    if (currentNow !== 'n0') return { body: 'ok' };
     const delay = url.includes('github') ? 150 : 20;
     await new Promise((resolve) => setTimeout(resolve, delay));
     return { body: 'ok' };
@@ -993,4 +1001,87 @@ test('真实延迟探测：慢→快重置 realSlowCount，偶发慢不误触发
 
   assert.deepEqual(selected, [], '偶发慢后恢复快不应触发切换');
   assert.equal(monitor.getSnapshot().channelA.realSlowCount, 0, '恢复快后 realSlowCount 应重置为 0');
+});
+
+test('切换后真实验证失败 → 立即回退切下一个候选', async () => {
+  // 核心场景：切到候选后立即真实验证，真实失效则排除该候选继续切下一个，
+  // 避免「切到失效节点」陷入长判定等待
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  // n0 真实慢触发切换；n1 也真实慢（切换后验证失败回退）；n2 真实快（验证成功）
+  const httpGetImpl = async () => {
+    const delay = currentNow === 'n2' ? 10 : 50;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    return { body: 'ok' };
+  };
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realDelayMs: 30, realProbeTimeoutMs: 500, realSlowThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  // n1 切换后真实验证失败被回退，继续切 n2 并成功
+  assert.deepEqual(selected, ['n1', 'n2'], 'n1 切换后真实验证失效应回退切 n2');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});
+
+test('候选复核并行：排序后第一个候选不可达，跳过切第二个', async () => {
+  // 复核前 preSwitchMaxProbe 个候选并行探测，不可达者排除，取第一个可达（已按延迟升序）
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+
+  const selected = [];
+  let n1Reachable = true;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') return { ok: false, reason: 'timeout' }; // 当前节点失效，触发切换
+      if (node === 'n1') return n1Reachable ? { ok: true, delay: 10 } : { ok: false, reason: 'timeout' };
+      return { ok: true, delay: 20 };
+    },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, failureThreshold: 1 },
+    clock,
+    logger: makeLogger(),
+  });
+
+  await monitor.poolCycle();
+  // poolCycle 时 n1 可达，候选池按延迟升序 = ['n1'(10ms), 'n2'(20ms)]
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  // 触发切换前 n1 变不可达：复核时 n1 被排除，切 n2
+  n1Reachable = false;
+
+  for (let i = 0; i < 2; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['n2'], 'n1 复核不可达应被跳过，切 n2');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
 });
