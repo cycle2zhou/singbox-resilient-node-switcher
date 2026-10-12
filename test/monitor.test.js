@@ -757,8 +757,90 @@ test('tag 漂移：切换前后按 stableKey 剔除新旧节点，确认用 stab
   // 候选复核前应排除 stableKey 等于当前节点的 'n0 | 5ms'，切到 n1
   assert.deepEqual(selected, ['n1']);
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
-  // 切换成功后按 stableKey 剔除新节点 n1 与旧节点 n0 系列，只剩 n2
-  assert.deepEqual(monitor.getSnapshot().candidates, ['n2']);
+  // 方案 B：切换流程只消耗局部 candidatePool，不持久缩小模块级 candidates
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n0 | 5ms', 'n1', 'n2']);
+});
+
+test('候选池为空时兜底切换到 URLTest 组', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(
+    currentNow,
+    ['🎈 自动选择', 'n0', 'n1'],
+    {
+      '🎈 自动选择': { type: 'URLTest', now: 'inner-1', all: ['inner-1'] },
+      'n0': { type: 'Shadowsocks' },
+      'n1': { type: 'Shadowsocks' },
+      'inner-1': { type: 'Shadowsocks' },
+    },
+  );
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: false, reason: 'timeout' }),
+    select: async (_group, node) => {
+      selected.push(node);
+      currentNow = node;
+      return { ok: true };
+    },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  // 不跑 poolCycle，candidates 保持为空；当前节点连续失败 3 次触发切换
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  // 候选池空 + 当前节点失败达阈值 → 兜底切到 URLTest 组
+  assert.deepEqual(selected, ['🎈 自动选择']);
+  assert.equal(monitor.getSnapshot().currentNow, '🎈 自动选择');
+});
+
+test('方案 B：候选复核不可达不持久消耗候选池', async () => {
+  let currentNow = 'n0';
+  let poolDone = false;
+  const proxies = () => selectorProxy(
+    currentNow,
+    ['n0', 'n1', 'n2', 'n3'],
+    leafTypes(['n0', 'n1', 'n2', 'n3']),
+  );
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n0') return { ok: false, reason: 'timeout' };
+      if (node === 'n1' && poolDone) return { ok: false, reason: 'timeout' }; // 复核阶段 n1 瞬时不可达
+      return { ok: true, delay: node === 'n1' ? 5 : 10 };
+    },
+    select: async (_group, node) => {
+      selected.push(node);
+      currentNow = node;
+      return { ok: true };
+    },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  poolDone = true;
+  // poolCycle 后 candidates 按 delay 升序：n1(5) < n2(10) = n3(10)
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2', 'n3']);
+
+  for (let i = 0; i < 3; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  // n1 复核不可达被跳过，切到 n2
+  assert.deepEqual(selected, ['n2']);
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+  // 方案 B：复核不可达的 n1 未被持久剔除，候选池仍完整
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2', 'n3']);
 });
 
 test('切换 API 失败时记 lastError 并重置 failureCount，避免累积卡死', async () => {

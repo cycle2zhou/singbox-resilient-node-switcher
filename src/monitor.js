@@ -504,22 +504,55 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
 
       if (shouldSwitch && dwellSatisfied) {
         if (candidates.length === 0) {
+          // 候选池耗尽兜底：切到 URLTest 组（sing-box 自带 interval/tolerance 自动切换），
+          // 避免两次 poolCycle 之间候选池被清空后故障切换失败、卡死在死节点。
+          const urlTestGroup = members.find((tag) => memberTypes[tag] === 'URLTest');
+          if (urlTestGroup && stableKey(urlTestGroup) !== stableKey(observedNow)) {
+            try {
+              await api.select(cfg.selectorName, urlTestGroup, cycleController.signal);
+              const oldState = ensureNodeState(observedNow);
+              nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
+              lastSwitch = { from: observedNow, to: urlTestGroup, at: now };
+              currentNow = urlTestGroup;
+              lastObservedNow = urlTestGroup;
+              currentStartAt = now;
+              watchBaseline = [];
+              watchFailureCount = 0;
+              watchDegradationCount = 0;
+              watchOptimizeCount = 0;
+              watchSlowCount = 0;
+              realSlowCount = 0;
+              realDelay = null;
+              stalking = true;
+              stalkingSuccessCount = 0;
+              realProbeGeneration += 1; // 使在途真实探测结果过期
+              scheduleStalkProbe();
+              log.info(`候选池为空，已兜底切换到 URLTest 组 ${urlTestGroup}`);
+              return { skipped: false, switchedTo: urlTestGroup, error: null };
+            } catch (error) {
+              lastError = `候选池为空且切换到 URLTest 组失败: ${error?.message || String(error)}`;
+              log.error(lastError);
+              return { skipped: false, switchedTo: null, error: lastError };
+            }
+          }
           lastError = '候选池为空，等待通道 B 刷新';
           log.info(lastError);
           return { skipped: false, switchedTo: null, error: lastError };
         }
 
-        // tag 漂移下，候选池可能残留「当前节点」的旧/新后缀快照，切换前按稳定身份排除
-        candidates = candidates.filter((t) => stableKey(t) !== stableKey(observedNow));
+        // tag 漂移下，候选池可能残留「当前节点」的旧/新后缀快照，切换前按稳定身份排除。
+        // 方案 B：复核与剔除只在本次切换的局部 candidatePool 上进行，不持久消耗模块级
+        // candidates，避免两次 poolCycle 之间候选池被「复核不可达」逐步耗尽清空。
+        let candidatePool = candidates.filter((t) => stableKey(t) !== stableKey(observedNow));
 
         // 循环切换：切到候选后立即真实验证，真实失效则排除该候选继续切下一个，
         // 最多尝试 preSwitchMaxProbe 个候选，避免「切到失效节点」陷入长判定等待
         let attempts = 0;
-        while (candidates.length > 0 && attempts < cfg.preSwitchMaxProbe) {
+        while (candidatePool.length > 0 && attempts < cfg.preSwitchMaxProbe) {
           attempts += 1;
 
           // 并行复核前 preSwitchMaxProbe 个候选（已按延迟升序），取最快可达者
-          const probePool = candidates.slice(0, cfg.preSwitchMaxProbe);
+          const probePool = candidatePool.slice(0, cfg.preSwitchMaxProbe);
           const checks = await Promise.all(probePool.map(async (candidate) => {
             const check = await probeAny(
               candidate,
@@ -532,7 +565,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
           const unreachable = new Set(checks.filter((c) => !c.ok).map((c) => c.candidate));
           const reachable = checks.filter((c) => c.ok).map((c) => c.candidate);
           if (unreachable.size > 0) {
-            candidates = candidates.filter((t) => !unreachable.has(t));
+            candidatePool = candidatePool.filter((t) => !unreachable.has(t));
             for (const c of unreachable) log.warn(`候选 ${c} 复核不可达，跳过`);
           }
           if (reachable.length === 0) {
@@ -583,7 +616,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
               // 真实失效/超慢：标记 cooldown 排除该候选，继续循环切下一个
               const targetState = ensureNodeState(target);
               nodeStates.set(target, markCooldown(targetState, now, cfg));
-              candidates = candidates.filter((t) => stableKey(t) !== stableKey(target));
+              candidatePool = candidatePool.filter((t) => stableKey(t) !== stableKey(target));
               continue;
             }
 
@@ -594,7 +627,6 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
             currentNow = target;
             lastObservedNow = target;
             currentStartAt = now;
-            candidates = candidates.filter((t) => stableKey(t) !== stableKey(target) && stableKey(t) !== stableKey(observedNow));
             watchBaseline = [];
             watchFailureCount = 0;
             watchDegradationCount = 0;
