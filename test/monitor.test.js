@@ -386,6 +386,46 @@ test('外部 now 变化接受新选择、重置快探窗口、不切回', async 
   assert.equal(snap.channelA.failureCount, 1, '新选择节点失败窗口应从零重新累积');
 });
 
+test('手动切换到不可用节点后立即进入盯梢并切换到下一个可用节点', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n1' ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: { ...fastConfig, minDwellMs: 60000 }, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  await monitor.watchCycle();
+  currentNow = 'n1';
+  await monitor.watchCycle();
+
+  assert.deepEqual(selected, ['n2'], '手动切到不可用节点后下一轮应立即切换到可用候选');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});
+
+test('同一稳定节点的测速后缀变化不应重置盯梢失败计数', async () => {
+  let currentNow = 'n0 | 10ms';
+  const proxies = () => selectorProxy(currentNow, ['n0 | 10ms', 'n1 | 10ms'], leafTypes(['n0 | 10ms', 'n1 | 10ms']));
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: false, reason: 'timeout' }),
+    select: async () => ({ ok: true }),
+  });
+
+  const monitor = createMonitor({ api, config: { ...fastConfig, minDwellMs: 60000 }, clock: makeClock(0), logger: makeLogger() });
+
+  await monitor.watchCycle();
+  currentNow = 'n0 | 20ms';
+  await monitor.watchCycle();
+
+  assert.equal(monitor.getSnapshot().channelA.failureCount, 2, '同一稳定节点后缀变化不应清空失败计数');
+});
+
 test('动态节点名漂移时 watchCycle 同步 members 使 currentNow 可被精确匹配', async () => {
   // 模拟 GFS 实时测速改写节点名（追加 IP 后缀），两次响应间节点名漂移
   let version = 1;
@@ -618,8 +658,20 @@ test('盯梢期：新节点连续成功 stalkSuccessThreshold 次后退出，恢
     select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
   });
 
+  // 新节点真实 GET 快速达标（10ms < realDelayMs），用于盯梢期退出判定
+  const httpGetImpl = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return { body: 'ok' };
+  };
+
   const clock = makeClock(0);
-  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realProbeUrls: ['https://github.com'], realDelayMs: 100, realProbeTimeoutMs: 500, realStalkSuccessThreshold: 2 },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
 
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
@@ -631,12 +683,11 @@ test('盯梢期：新节点连续成功 stalkSuccessThreshold 次后退出，恢
   assert.deepEqual(selected, ['n1']);
   assert.equal(monitor.getSnapshot().channelA.stalking, true);
 
-  // 盯梢期 n1 成功 2 次 → 退出盯梢
+  // 盯梢期真实 GET 连续达标 2 次 → 退出盯梢（HEAD 成功不单独累计）
   for (let i = 0; i < 2; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
+    await monitor.runRealProbe();
   }
-  assert.equal(monitor.getSnapshot().channelA.stalking, false, '连续成功 2 次应退出盯梢');
+  assert.equal(monitor.getSnapshot().channelA.stalking, false, '真实 GET 连续达标 2 次应退出盯梢');
 
   // 退出盯梢后 n1 失败 1 次：failureThreshold=3，不立即切（candidates 仍有 n2）
   n1down = true;
@@ -792,11 +843,11 @@ test('真实延迟探测：真实 GET 延迟超过 realDelayMs 触发切换（si
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
 
-  // 第一次 watchCycle 累积 realSlowCount（dwell 未满足），第二次 dwell 满足后触发切换
-  for (let i = 0; i < 2; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  // 先 watchCycle 建立 currentNow，再 runRealProbe 累积 realSlowCount，最后 dwell 满足后触发切换
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, ['n1'], '真实 GET 延迟超阈值应触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
@@ -834,10 +885,10 @@ test('真实延迟探测：sing-box 探测不慢（608ms）但真实访问超阈
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
 
-  for (let i = 0; i < 2; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, ['n1'], 'sing-box 探测不慢但真实访问慢应触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
@@ -872,13 +923,14 @@ test('真实延迟探测：真实 GET 延迟未超过 realDelayMs 不触发切�
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
 
-  for (let i = 0; i < 5; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, [], '真实延迟未超阈值不应触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n0');
+  assert.equal(monitor.getSnapshot().channelA.realSlowCount, 0, '真实快时 realSlowCount 应为 0');
 });
 
 test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测通但真实不通）', async () => {
@@ -910,11 +962,11 @@ test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
 
-  // sing-box 探测通但真实 GET 全失败，realSlowCount 累积触发切换
-  for (let i = 0; i < 2; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  // sing-box 探测通但真实 GET 全失败：runRealProbe 累积 realSlowCount，再 watchCycle 触发切换
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, ['n1'], '真实访问全失败应触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
@@ -953,10 +1005,10 @@ test('真实延迟探测：多 URL 取最慢延迟，快 URL 不掩盖慢 URL', 
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
 
-  for (let i = 0; i < 2; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, ['n1'], '多 URL 应取最慢延迟，慢 URL 触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
@@ -995,10 +1047,18 @@ test('真实延迟探测：慢→快重置 realSlowCount，偶发慢不误触发
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
 
-  for (let i = 0; i < 5; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  await monitor.watchCycle();
+
+  // 第 1 次真实探测慢（150ms > realDelayMs=100）→ realSlowCount=1
+  await monitor.runRealProbe();
+  assert.equal(monitor.getSnapshot().channelA.realSlowCount, 1, '第 1 次真实慢应累积 realSlowCount');
+
+  // 第 2 次真实探测快（20ms）→ realSlowCount 重置 0
+  await monitor.runRealProbe();
+  assert.equal(monitor.getSnapshot().channelA.realSlowCount, 0, '恢复快后 realSlowCount 应重置为 0');
+
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, [], '偶发慢后恢复快不应触发切换');
   assert.equal(monitor.getSnapshot().channelA.realSlowCount, 0, '恢复快后 realSlowCount 应重置为 0');
@@ -1036,10 +1096,10 @@ test('切换后真实验证失败 → 立即回退切下一个候选', async () 
   await monitor.poolCycle();
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
 
-  for (let i = 0; i < 2; i += 1) {
-    await monitor.watchCycle();
-    clock.advance(1000);
-  }
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  clock.advance(1000);
+  await monitor.watchCycle();
 
   // n1 切换后真实验证失败被回退，继续切 n2 并成功
   assert.deepEqual(selected, ['n1', 'n2'], 'n1 切换后真实验证失效应回退切 n2');
@@ -1124,7 +1184,7 @@ test('真实延迟探测：多 URL 并行（Promise.all）同时发起请求', a
   });
 
   await monitor.poolCycle();
-  await monitor.watchCycle();
+  await monitor.runRealProbe();
 
   assert.ok(maxConcurrent >= 2, `多 URL 应并行探测（峰值并发 ${maxConcurrent} >= 2）`);
 });
@@ -1186,10 +1246,15 @@ test('盯梢期真实探测用更短超时：中等慢节点在短超时下被�
   clock.advance(1000);
   assert.deepEqual(selected, ['n1'], 'n0 失效应切到 n1');
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
+  assert.equal(monitor.getSnapshot().channelA.stalking, true, '切换后进入盯梢期');
 
-  // 第三轮（盯梢快探，stalking=true）：n1 真实 60ms > realStalkTimeoutMs=30 → 超时失败 → 触发再切 n2
-  await monitor.watchCycle();
+  // 盯梢期 runRealProbe：n1 真实 60ms > realStalkTimeoutMs=30 超时失败 → realSlowCount=1
+  await monitor.runRealProbe();
+  assert.equal(monitor.getSnapshot().channelA.realSlowCount, 1, '盯梢期短超时下 n1 60ms 应判失败');
+
+  // 盯梢期 realSlowCount 达标 + 免驻留，触发再切 n2
   clock.advance(1000);
+  await monitor.watchCycle();
 
   assert.deepEqual(selected, ['n1', 'n2'], '盯梢期短超时下 n1 60ms 超时失效应触发再切 n2');
   assert.equal(monitor.getSnapshot().currentNow, 'n2');

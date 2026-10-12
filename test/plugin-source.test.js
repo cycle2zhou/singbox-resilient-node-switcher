@@ -85,6 +85,9 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
     RealProbeTimeoutMs: String(DEFAULT_CONFIG.realProbeTimeoutMs),
     RealStalkTimeoutMs: String(DEFAULT_CONFIG.realStalkTimeoutMs),
     RealSlowThreshold: String(DEFAULT_CONFIG.realSlowThreshold),
+    RealProbeIntervalMs: String(DEFAULT_CONFIG.realProbeIntervalMs),
+    RealStalkSuccessThreshold: String(DEFAULT_CONFIG.realStalkSuccessThreshold),
+    EventLogLimit: String(DEFAULT_CONFIG.eventLogLimit),
   };
 
   for (const [key, value] of Object.entries(expected)) {
@@ -126,6 +129,9 @@ test('插件源码读取全部双通道配置键', () => {
     'Plugin.RealProbeTimeoutMs',
     'Plugin.RealStalkTimeoutMs',
     'Plugin.RealSlowThreshold',
+    'Plugin.RealProbeIntervalMs',
+    'Plugin.RealStalkSuccessThreshold',
+    'Plugin.EventLogLimit',
   ];
   for (const key of keys) {
     assert.ok(pluginSource.includes(key), `插件源码应读取 ${key}`);

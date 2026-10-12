@@ -88,6 +88,9 @@
 | 真实探测超时(ms) | `RealProbeTimeoutMs` | `8000` | 单次真实 GET 探测的超时 |
 | 盯梢期真实探测超时(ms) | `RealStalkTimeoutMs` | `3000` | 切换后盯梢期（快速检测）的真实 GET 探测超时，更短以便尽快发现慢节点再切 |
 | 真实慢连续次数 | `RealSlowThreshold` | `1` | 真实 GET 连续多少次超阈值（或全部失败）后触发切换 |
+| 真实探测间隔(ms) | `RealProbeIntervalMs` | `15000` | 正常期真实 GET 探测的间隔；盯梢期自动缩短以尽快确认新节点 |
+| 盯梢退出真实达标次数 | `RealStalkSuccessThreshold` | `2` | 切换后新节点真实 GET 连续达标多少次才退出盯梢期；HEAD 快但真实慢的节点不会提前退出 |
+| 事件时间线条数 | `EventLogLimit` | `50` | 内存中保留的最近事件条数（环形队列），用于诊断 |
 
 ## 状态机
 

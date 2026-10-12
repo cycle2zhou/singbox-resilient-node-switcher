@@ -69,6 +69,14 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
   let stalking = false;
   let stalkingSuccessCount = 0;
   let stalkTimer = null;
+  // 真实探测单飞：真实 GET 独立于 HEAD 快探周期，单飞避免并发堆积；
+  // generation 用于丢弃「节点已变化/已切换」后的过期结果
+  let realProbeInFlight = false;
+  let realProbeGeneration = 0;
+  let realProbeLastAt = 0;
+  let realProbeTimer = null;
+  // 事件时间线：内存环形队列，仅保留最近 eventLogLimit 条
+  let eventLog = [];
 
   function ensureNodeState(tag) {
     if (!nodeStates.has(tag)) {
@@ -164,6 +172,78 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       stalkTimer = null;
       watchCycle().catch((error) => log.error('盯梢快探异常', error?.message || String(error)));
     }, cfg.stalkProbeDelayMs);
+  }
+
+  function recordEvent(type, fields = {}) {
+    eventLog.push({ type, at: time.now(), ...fields });
+    if (eventLog.length > cfg.eventLogLimit) {
+      eventLog = eventLog.slice(-cfg.eventLogLimit);
+    }
+  }
+
+  // 单飞真实探测：真实 GET 走系统代理读 body 测真实延迟，覆盖 sing-box HEAD 探测盲区。
+  // 独立于 HEAD 快探周期、不阻塞 watchCycle；结果绑定 stableKey + generation，
+  // 节点已变化/切换后返回的过期结果直接丢弃。
+  async function runRealProbe() {
+    if (!cfg.realProbeEnabled || realProbeInFlight || currentNow == null) {
+      return { skipped: true, stale: false };
+    }
+    realProbeInFlight = true;
+    const generation = ++realProbeGeneration;
+    const targetKey = stableKey(currentNow);
+    const isStalking = stalking;
+    const timeoutMs = isStalking ? cfg.realStalkTimeoutMs : cfg.realProbeTimeoutMs;
+    recordEvent('real-probe-start', { key: targetKey, generation, stalking: isStalking });
+    try {
+      const realResult = await realProbeAny(cfg.realProbeUrls, timeoutMs);
+      // 过期丢弃：节点身份已变（外部切换/自动切换）或期间已启动新探测
+      if (stableKey(currentNow) !== targetKey || generation !== realProbeGeneration) {
+        recordEvent('real-probe-stale', { key: targetKey, generation });
+        return { skipped: false, stale: true };
+      }
+      if (realResult.ok && realResult.result) {
+        realDelay = realResult.result.delay;
+        if (realResult.result.delay > cfg.realDelayMs) {
+          realSlowCount += 1;
+        } else {
+          realSlowCount = 0;
+          // 盯梢期：真实 GET 达标才累计，达到 realStalkSuccessThreshold 次退出盯梢
+          if (stalking) {
+            stalkingSuccessCount += 1;
+            if (stalkingSuccessCount >= cfg.realStalkSuccessThreshold) {
+              stalking = false;
+              stalkingSuccessCount = 0;
+              recordEvent('stalk-exit', { key: targetKey });
+              log.info('盯梢期结束，新节点真实可用');
+            }
+          }
+        }
+      } else {
+        realDelay = null;
+        realSlowCount += 1;
+      }
+      recordEvent('real-probe-result', { key: targetKey, generation, ok: realResult.ok, delay: realDelay, realSlowCount, stalking });
+      return { skipped: false, stale: false, ok: realResult.ok };
+    } finally {
+      realProbeInFlight = false;
+      realProbeLastAt = time.now();
+    }
+  }
+
+  // 真实探测调度：setTimeout 链式，按是否盯梢动态调整间隔
+  function scheduleRealProbe() {
+    if (!running || !cfg.realProbeEnabled) return;
+    if (realProbeTimer) clearTimeout(realProbeTimer);
+    const interval = stalking ? cfg.stalkProbeDelayMs : cfg.realProbeIntervalMs;
+    realProbeTimer = setTimeout(() => {
+      realProbeTimer = null;
+      runRealProbe()
+        .then(() => scheduleRealProbe())
+        .catch((error) => {
+          log.error('真实探测异常', error?.message || String(error));
+          scheduleRealProbe();
+        });
+    }, interval);
   }
 
   async function runPoolProbe(tag, signal, urls) {
@@ -325,8 +405,9 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       const now = time.now();
       const observedNow = selector.now;
 
-      // 外部变化检测：接受新选择、重置快探窗口，不切回旧节点
-      if (lastObservedNow !== null && lastObservedNow !== observedNow) {
+      // 外部变化检测：接受新选择，不切回旧节点；手动选择的新节点立即进入盯梢期
+      // stableKey 忽略 GFS 实时测速追加的延迟/速度后缀，避免同一节点被反复重置。
+      if (lastObservedNow !== null && stableKey(lastObservedNow) !== stableKey(observedNow)) {
         watchBaseline = [];
         watchFailureCount = 0;
         watchDegradationCount = 0;
@@ -334,7 +415,8 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         watchSlowCount = 0;
         realSlowCount = 0;
         realDelay = null;
-        stalking = false;
+        realProbeGeneration += 1; // 使在途真实探测结果过期
+        stalking = true;
         stalkingSuccessCount = 0;
         currentStartAt = now;
       }
@@ -380,14 +462,6 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
           watchBaseline = watchBaseline.slice(-cfg.baselineWindow);
         }
         watchFailureCount = 0;
-        if (stalking) {
-          stalkingSuccessCount += 1;
-          if (stalkingSuccessCount >= cfg.stalkSuccessThreshold) {
-            stalking = false;
-            stalkingSuccessCount = 0;
-            log.info('盯梢期结束，新节点稳定');
-          }
-        }
         if (watchBaseline.length >= cfg.baselineWindow && result.delay > median(watchBaseline) * cfg.degradationRatio) {
           watchDegradationCount += 1;
         } else {
@@ -398,22 +472,6 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
           watchSlowCount += 1;
         } else {
           watchSlowCount = 0;
-        }
-
-        // 真实延迟探测：sing-box 的 /delay 用 HEAD 不读 body，系统性低估真实 GET 延迟，
-        // 用 httpGetImpl（native 层 HttpGet，走系统代理）测真实延迟作为可靠的慢判定（覆盖「探测快但真实慢」的盲区）。
-        if (cfg.realProbeEnabled) {
-          // 盯梢期内用更短超时，尽快发现「切到的节点其实慢/不通」并触发再切换
-          const realTimeout = stalking ? cfg.realStalkTimeoutMs : cfg.realProbeTimeoutMs;
-          const realResult = await realProbeAny(cfg.realProbeUrls, realTimeout);
-          if (realResult.ok && realResult.result) {
-            realDelay = realResult.result.delay;
-            realSlowCount = realResult.result.delay > cfg.realDelayMs ? realSlowCount + 1 : 0;
-          } else {
-            // 真实访问全部失败：sing-box 探测通但真实 GET 不通，视为慢/故障盲区
-            realDelay = null;
-            realSlowCount += 1;
-          }
         }
 
         // 性能择优：当前节点延迟明显高于候选池最优时累积计数，连续达标后切到最优节点
@@ -433,12 +491,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       }
 
       const optimizeTriggered = watchOptimizeCount >= cfg.optimizeThreshold;
-      // 盯梢期内：失败 1 次即切、免驻留，尽快摆脱故障节点
+      // 盯梢期内：失败 1 次即切、HEAD 高延迟 1 次即切、免驻留，尽快摆脱故障节点
       const effectiveFailureThreshold = stalking ? 1 : cfg.failureThreshold;
+      const effectiveSlowThreshold = stalking ? 1 : cfg.slowThreshold;
       const effectiveMinDwellMs = stalking ? 0 : cfg.minDwellMs;
       const shouldSwitch = (watchFailureCount >= effectiveFailureThreshold)
         || (watchDegradationCount >= cfg.degradationThreshold)
-        || (watchSlowCount >= cfg.slowThreshold)
+        || (watchSlowCount >= effectiveSlowThreshold)
         || (realSlowCount >= cfg.realSlowThreshold)
         || optimizeTriggered;
       const dwellSatisfied = now >= (currentStartAt ?? now) + effectiveMinDwellMs;
@@ -545,6 +604,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
             realDelay = null;
             stalking = true;
             stalkingSuccessCount = 0;
+            realProbeGeneration += 1; // 使在途真实探测结果过期
             scheduleStalkProbe();
             log.info(`已切换到 ${target}`);
             return { skipped: false, switchedTo: target, error: null };
@@ -586,6 +646,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     poolTimer = setInterval(() => {
       poolCycle().catch((error) => log.error('候选池轮次异常', error?.message || String(error)));
     }, cfg.poolRefreshIntervalMs);
+    scheduleRealProbe();
   }
 
   function stop() {
@@ -602,8 +663,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       clearTimeout(stalkTimer);
       stalkTimer = null;
     }
+    if (realProbeTimer) {
+      clearTimeout(realProbeTimer);
+      realProbeTimer = null;
+    }
     stalking = false;
     stalkingSuccessCount = 0;
+    realProbeGeneration += 1; // 使在途真实探测结果过期
     watchController?.abort();
     watchController = null;
     poolController?.abort();
@@ -639,8 +705,9 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         stalkingSuccessCount,
       },
       candidates: [...candidates],
+      events: [...eventLog],
     };
   }
 
-  return { start, stop, getSnapshot, watchCycle, poolCycle };
+  return { start, stop, getSnapshot, watchCycle, poolCycle, runRealProbe };
 }

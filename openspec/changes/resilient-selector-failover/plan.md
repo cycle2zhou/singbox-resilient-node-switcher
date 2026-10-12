@@ -86,3 +86,19 @@
 - [ ] 完成安装、配置、状态机、回滚、限制和用户验收文档；不写未验证的网络成功承诺。
 - [ ] 运行 `node --test` 与 `openspec validate --all --json`，确认全部通过和 OpenSpec valid。
 - [ ] 提交 `docs: document resilient selector switcher`；生成完整 diff，等待用户人工审阅，不自动推送或创建 PR。
+
+---
+
+## Task 7: 分层检测改造
+
+**Files:** `src/config.js`, `src/monitor.js`, `test/config.test.js`, `test/monitor.test.js`, `scripts/plugin-adapter.js`, `plugins/gfs.json`, `README.md`
+
+**Goal:** 修复手动切到高延迟/真实慢节点未快速切换的问题：真实探测从 watchCycle 解耦（单飞 + generation 过期丢弃）、盯梢只由真实 GET 达标退出、盯梢期高延迟一次即切。
+
+- [ ] **Step 1（写失败测试）:** 在 `test/config.test.js` 增加 `realProbeIntervalMs:15000`、`realStalkSuccessThreshold:2`、`eventLogLimit:50` 默认值断言；在 `test/monitor.test.js` 增加：真实探测单飞（在途时不重复发起）、过期结果丢弃（节点变化后旧结果不更新状态）、盯梢只由真实 GET 达标退出（HEAD 成功不累计）、盯梢期 HEAD 高延迟一次即切、事件环形队列记录。运行 `node --test test/config.test.js test/monitor.test.js`，确认新断言失败。
+- [ ] **Step 2:** 实现 `src/config.js`：`DEFAULT_CONFIG` 增加 `realProbeIntervalMs:15000`、`realStalkSuccessThreshold:2`、`eventLogLimit:50`；`POSITIVE_KEYS` 加 `realProbeIntervalMs`，`POSITIVE_INTEGER_KEYS` 加 `realStalkSuccessThreshold`、`eventLogLimit`。跑 `node --test test/config.test.js` 通过。
+- [ ] **Step 3:** 实现 `src/monitor.js` 的 `recordEvent(type, fields)` 环形队列（截断到 `cfg.eventLogLimit`）并在 `getSnapshot()` 返回 `events`（最近摘要数组）。跑 `node --test test/monitor.test.js`。
+- [ ] **Step 4:** 实现 `runRealProbe()` 单飞真实探测：`realProbeInFlight` 守卫；启动时捕获 `generation = ++realProbeGeneration` 与 `targetKey = stableKey(currentNow)`；结果返回时若 `stableKey(currentNow) !== targetKey` 或 `generation !== realProbeGeneration` 则记录 stale 事件并丢弃；成功且延迟 ≤ `realDelayMs` 时在盯梢期累计 `stalkingSuccessCount`、达到 `realStalkSuccessThreshold` 退出盯梢；失败或超阈值则 `realSlowCount += 1`。完成后若 `running && realSlowCount >= realSlowThreshold` 主动触发一次 `watchCycle()`。跑 `node --test test/monitor.test.js`。
+- [ ] **Step 5:** 改造 `watchCycle`：移除 406-418 行 `await realProbeAny(...)` 阻塞；HEAD 成功分支移除 `stalkingSuccessCount += 1`；HEAD 探测后按「`!realProbeInFlight` 且（`stalking` 或距 `realProbeLastAt` 超过 `realProbeIntervalMs`）」fire-and-forget 触发 `runRealProbe()`（不 await）；`shouldSwitch` 增加 `effectiveSlowThreshold = stalking ? 1 : cfg.slowThreshold` 并用它替换 `cfg.slowThreshold`；外部变化检测与切换成功处 `++realProbeGeneration` 使在途结果过期。跑全量 `node --test`。
+- [ ] **Step 6:** 同步 `scripts/plugin-adapter.js`（`buildConfig` 增加 3 键）、`plugins/gfs.json`（`configuration` 增加 RealProbeIntervalMs、RealStalkSuccessThreshold、EventLogLimit）、`README.md`（配置表增加 3 行）；`node scripts/build-plugin.js` 构建。
+- [ ] **Step 7:** 全量 `node --test` + `openspec validate --all --json` + `node --check plugins/GFS/plugin-singbox-resilient-node-switcher.js`；替换到 `/Users/cycle/Library/Application Support/GUI.for.SingBox/plugins/plugin-ID_ydtsx0sz.js`（备份 `.bak-layered-detection`）；提交 `feat(monitor): 分层检测，解耦真实探测并修正盯梢退出依据`。

@@ -68,6 +68,9 @@ export default (Plugin) => {
       realProbeTimeoutMs: Number(Plugin.RealProbeTimeoutMs),
       realStalkTimeoutMs: Number(Plugin.RealStalkTimeoutMs),
       realSlowThreshold: Number(Plugin.RealSlowThreshold),
+      realProbeIntervalMs: Number(Plugin.RealProbeIntervalMs),
+      realStalkSuccessThreshold: Number(Plugin.RealStalkSuccessThreshold),
+      eventLogLimit: Number(Plugin.EventLogLimit),
     };
   }
 

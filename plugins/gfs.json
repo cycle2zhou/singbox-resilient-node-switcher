@@ -283,6 +283,33 @@
       "component": "Input",
       "value": "1",
       "options": []
+    },
+    {
+      "id": "ID_real_probe_interval_ms",
+      "title": "真实探测间隔(ms)",
+      "description": "正常期真实 GET 探测的间隔，默认 15000；盯梢期自动缩短以尽快确认新节点",
+      "key": "RealProbeIntervalMs",
+      "component": "Input",
+      "value": "15000",
+      "options": []
+    },
+    {
+      "id": "ID_real_stalk_success_threshold",
+      "title": "盯梢退出真实达标次数",
+      "description": "切换后新节点真实 GET 连续达标多少次才退出盯梢期，默认 2；HEAD 快但真实慢的节点不会提前退出",
+      "key": "RealStalkSuccessThreshold",
+      "component": "Input",
+      "value": "2",
+      "options": []
+    },
+    {
+      "id": "ID_event_log_limit",
+      "title": "事件时间线条数",
+      "description": "内存中保留的最近事件条数（环形队列），用于诊断，默认 50",
+      "key": "EventLogLimit",
+      "component": "Input",
+      "value": "50",
+      "options": []
     }
   ],
   "disabled": false,
