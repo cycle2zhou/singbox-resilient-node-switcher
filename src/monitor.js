@@ -329,8 +329,18 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       const results = [];
       for (let i = 0; i < probeTargets.length; i += cfg.poolConcurrency) {
         const batch = probeTargets.slice(i, i + cfg.poolConcurrency);
-        const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls)));
-        results.push(...batchResults);
+        try {
+          const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls)));
+          results.push(...batchResults);
+        } catch (error) {
+          if (cycleController.signal.aborted) {
+            nodeStates.clear();
+            for (const [k, v] of snapshotStates) nodeStates.set(k, v);
+            candidates = snapshotCandidates;
+            return { skipped: true, error: null };
+          }
+          throw error;
+        }
       }
 
       // 全池失败熔断：实际探测节点失败率超过阈值则本轮作废
@@ -605,7 +615,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
             // 切换后立即真实验证：真实 GET 读 body，识别「探测通但真实失效/超慢」的节点
             let realOk = true;
             if (cfg.realProbeEnabled) {
-              const realCheck = await realProbeAny(cfg.realProbeUrls, cfg.realProbeTimeoutMs);
+              const realCheck = await realProbeAny(cfg.realProbeUrls, cfg.realStalkTimeoutMs);
               realOk = realCheck.ok && realCheck.result && realCheck.result.delay <= cfg.realDelayMs;
               if (!realOk) {
                 const realMs = realCheck.ok && realCheck.result ? realCheck.result.delay : null;

@@ -485,6 +485,37 @@ test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', as
   );
 });
 
+test('watchCycle 不被池刷新阻塞且刷新完成前保留上一轮候选池', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  let currentNow = 'n0';
+  let poolProbeCount = 0;
+  let poolProbeStarted;
+  const poolProbeReady = new Promise((resolve) => { poolProbeStarted = resolve; });
+  let releaseProbe;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, tags, leafTypes(tags)) }),
+    probe: async (tag) => {
+      if (tag === 'n1' && ++poolProbeCount === 2) {
+        poolProbeStarted();
+        return new Promise((resolve) => { releaseProbe = () => resolve({ ok: true, delay: 20 }); });
+      }
+      return { ok: true, delay: tag === 'n1' ? 20 : 30 };
+    },
+  });
+  const monitor = createMonitor({ api, config: { ...fastConfig, poolConcurrency: 1 }, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  const refresh = monitor.poolCycle();
+  await poolProbeReady;
+  await monitor.watchCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2'], '刷新未完成前不得清空上一轮候选池');
+  releaseProbe();
+  await refresh;
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2'], '刷新完成后应原子替换候选池');
+  assert.equal(monitor.getSnapshot().poolInProgress, false);
+});
+
 test('stop 时进行中的 poolCycle 不抛 null 异常', async () => {
   const tags = ['n0', 'n1', 'n2'];
   const proxies = selectorProxy('n0', tags, leafTypes(tags));
@@ -1185,6 +1216,48 @@ test('切换后真实验证失败 → 立即回退切下一个候选', async () 
 
   // n1 切换后真实验证失败被回退，继续切 n2 并成功
   assert.deepEqual(selected, ['n1', 'n2'], 'n1 切换后真实验证失效应回退切 n2');
+  assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});
+
+test('候选切换后的真实验证使用盯梢短超时，缩短失效候选等待', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => node === 'n0' ? { ok: false, reason: 'timeout' } : { ok: true, delay: node === 'n1' ? 10 : 20 },
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+  const httpGetImpl = async () => {
+    await new Promise((resolve) => setTimeout(resolve, currentNow === 'n1' ? 100 : 1));
+    return { body: 'ok' };
+  };
+  const clock = makeClock(0);
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      failureThreshold: 1,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://github.com'],
+      realDelayMs: 30,
+      realProbeTimeoutMs: 200,
+      realStalkTimeoutMs: 20,
+    },
+    clock,
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+
+  await monitor.poolCycle();
+  await monitor.watchCycle();
+  clock.advance(1000);
+  const startedAt = Date.now();
+  await monitor.watchCycle();
+  const elapsed = Date.now() - startedAt;
+
+  assert.deepEqual(selected, ['n1', 'n2'], '首个候选真实验证超时后应快速回退到下一个候选');
+  assert.ok(elapsed < 90, `候选回退不应等待长真实探测超时，实际耗时 ${elapsed}ms`);
   assert.equal(monitor.getSnapshot().currentNow, 'n2');
 });
 
