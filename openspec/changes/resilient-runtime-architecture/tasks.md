@@ -6,10 +6,10 @@
 
 ## 2. 候选扫描与快照存储隔离
 
-- [ ] 2.1 新增 `src/candidate-store.js`，实现 `createCandidateStore`、`getSnapshot`、`publish` 和 `getUsableCandidates`；仅接受更新 generation 且拓扑匹配的发布结果。
-- [ ] 2.2 新增 `src/candidate-scanner.js`，实现 `createCandidateScanner({api, config, clock, logger, store})`、`scan()`、`start()` 和 `stop()`；扫描使用局部状态、有限并发和整轮 deadline，完成后原子发布，失败或取消不发布半成品。
-- [ ] 2.3 新增 `test/candidate-store.test.js` 与 `test/candidate-scanner.test.js`，覆盖后台扫描不覆盖前台观察、旧扫描晚完成丢弃、整轮失败保留旧快照、deadline、拓扑变化和前后台并发预算。
-- [ ] 2.4 运行候选模块测试并提交 `feat: isolate candidate scanning and snapshots`。
+- [x] 2.1 新增 `src/candidate-store.js`，实现 `createCandidateStore`、`getSnapshot`、`publish` 和 `getUsableCandidates`；仅接受更新 generation 且拓扑匹配的发布结果。
+- [x] 2.2 新增 `src/candidate-scanner.js`，实现 `createCandidateScanner({api, config, clock, logger, store})`、`scan()`、`start()` 和 `stop()`；扫描使用局部状态、有限并发和整轮 deadline，完成后原子发布，失败或取消不发布半成品。
+- [x] 2.3 新增 `test/candidate-store.test.js` 与 `test/candidate-scanner.test.js`，覆盖后台扫描不覆盖前台观察、旧扫描晚完成丢弃、整轮失败保留旧快照、deadline、拓扑变化和前后台并发预算。
+- [x] 2.4 运行候选模块测试并提交 `feat: isolate candidate scanning and snapshots`。
 
 ## 3. 统一切换协调器
 
