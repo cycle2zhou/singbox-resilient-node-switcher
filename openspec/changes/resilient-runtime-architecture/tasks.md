@@ -20,10 +20,10 @@
 
 ## 4. 统一运行态与版本化持久化
 
-- [ ] 4.1 新增 `src/runtime-state.js`，实现事件归约入口 `createRuntimeState`、`applyRuntimeEvent` 和单调递增 `revision`，统一 currentNow、lastSwitch、候选快照、节点状态和盯梢状态。
-- [ ] 4.2 新增 `src/state-store.js`，实现 `createStateStore({readFile, writeFile, clock, logger})`、`load()`、`commit(event)` 和 `flush()`；写盘按 revision 防旧写覆盖，拒绝损坏或不自洽快照。
-- [ ] 4.3 新增 `test/runtime-state.test.js` 与 `test/state-store.test.js`，覆盖成功/失败切换提交、乱序写盘、写盘失败内存继续有效、损坏状态拒绝和重启时以 Clash API now 为准。
-- [ ] 4.4 提交 `feat: version runtime state persistence`。
+- [x] 4.1 新增 `src/runtime-state.js`，实现事件归约入口 `createRuntimeState`、`applyRuntimeEvent` 和单调递增 `revision`，统一 currentNow、lastSwitch、候选快照、节点状态和盯梢状态。
+- [x] 4.2 新增 `src/state-store.js`，实现 `createStateStore({readFile, writeFile, clock, logger})`、`load()`、`commit(event)` 和 `flush()`；写盘按 revision 防旧写覆盖，拒绝损坏或不自洽快照。
+- [x] 4.3 新增 `test/runtime-state.test.js` 与 `test/state-store.test.js`，覆盖成功/失败切换提交、乱序写盘、写盘失败内存继续有效、损坏状态拒绝和重启时以 Clash API now 为准。
+- [x] 4.4 提交 `feat: version runtime state persistence`。
 
 ## 5. 监控装配与生命周期
 
