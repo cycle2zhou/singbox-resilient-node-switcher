@@ -1,0 +1,102 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createCandidateStore } from '../src/candidate-store.js';
+import { createSwitchCoordinator } from '../src/switch-coordinator.js';
+
+function makeStore(candidates, { now = 0, expiresAt = 1000, topologyFingerprint = 'topology-1' } = {}) {
+  const store = createCandidateStore({ clock: { now: () => now } });
+  store.setTopology(topologyFingerprint);
+  store.publish({ generation: 1, createdAt: 0, expiresAt, topologyFingerprint, candidates });
+  return store;
+}
+
+function candidate(tag, delay = 10) {
+  return { tag, stableKey: tag, delay, checkedAt: 0 };
+}
+
+function baseOptions(overrides = {}) {
+  const calls = [];
+  let current = 'bad';
+  const api = {
+    async select(group, tag) { calls.push({ group, tag }); current = tag; return { ok: true }; },
+    async getProxies() { return { proxies: { selector: { now: current } } }; },
+    ...overrides.api,
+  };
+  return {
+    api,
+    config: { selectorName: 'selector', preSwitchMaxProbe: 3, poolRefreshIntervalMs: 100 },
+    clock: { now: () => 0 },
+    logger: { info() {}, warn() {}, error() {} },
+    observeCurrent: () => ({ now: current, stableKey: current, generation: 1 }),
+    realProbe: async () => ({ ok: true, delay: 10 }),
+    calls,
+    setCurrent(value) { current = value; },
+    ...overrides,
+  };
+}
+
+test('同一当前节点的并发故障请求只产生一个切换事务', async () => {
+  let release;
+  const options = baseOptions({
+    realProbe: () => new Promise((resolve) => { release = resolve; }),
+  });
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('good')]) });
+  const first = coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  const second = coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(options.calls.length, 1);
+  release({ ok: true, delay: 10 });
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.switchId, b.switchId);
+  assert.equal(options.calls.length, 1);
+});
+
+test('候选真实复核失败后回退到下一个候选', async () => {
+  const options = baseOptions({
+    realProbe: async (tag) => tag === 'bad-good' ? { ok: false, reason: 'unreachable' } : { ok: true, delay: 10 },
+  });
+  options.setCurrent('bad');
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('bad-good', 1), candidate('good', 2)]) });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'good');
+  assert.deepEqual(options.calls.map(({ tag }) => tag), ['bad-good', 'good']);
+});
+
+test('择优请求拒绝过期快照，故障请求允许过期候选但仍需实时复核', async () => {
+  const options = baseOptions({ clock: { now: () => 2000 } });
+  const store = makeStore([candidate('good')], { now: 0, expiresAt: 1000 });
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: store });
+  const optimize = await coordinator.requestSwitch({ reason: 'optimize', priority: 1 });
+  assert.equal(optimize.ok, false);
+  assert.equal(optimize.reason, 'candidate snapshot unavailable');
+  const failure = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(failure.ok, true);
+});
+
+test('PUT 后 now 不一致时不报告伪成功', async () => {
+  const base = baseOptions();
+  const options = {
+    ...base,
+    api: {
+      ...base.api,
+      async getProxies() { return { proxies: { selector: { now: 'other' } } }; },
+    },
+  };
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('good')]) });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'switch confirmation failed');
+});
+
+test('外部 now 变化使事务失效，不继续提交切换成功', async () => {
+  let observed = 'bad';
+  const options = baseOptions({
+    observeCurrent: () => ({ now: observed, stableKey: observed, generation: 1 }),
+    realProbe: async () => { observed = 'external'; return { ok: true, delay: 10 }; },
+  });
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('good')]) });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'current node changed');
+});
