@@ -1089,6 +1089,65 @@ test('真实探测失败在驻留期内也能触发主动切换', async () => {
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
 });
 
+test('真实探测触发切换时，正在执行的快探结束后仍会补跑切换', async () => {
+  let currentNow = 'n0';
+  const selected = [];
+  let releaseWatch;
+  let watchBlocked = true;
+  const watchReleased = new Promise((resolve) => { releaseWatch = resolve; });
+  const api = makeApi({
+    getProxies: async () => {
+      if (watchBlocked) await watchReleased;
+      return { proxies: selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1'])) };
+    },
+    probe: async () => ({ ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...DEFAULT_CONFIG, minDwellMs: 60000, realProbeEnabled: true, realProbeUrls: ['https://github.com'], realSlowThreshold: 1, stalkProbeDelayMs: 1 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => { throw new Error('network unreachable'); },
+  });
+
+  watchBlocked = false;
+  await monitor.poolCycle();
+  watchBlocked = true;
+  const activeWatch = monitor.watchCycle();
+  await new Promise((resolve) => setImmediate(resolve));
+  await monitor.runRealProbe();
+  const queuedWatch = monitor.watchCycle();
+  assert.deepEqual(await queuedWatch, { skipped: true, switchedTo: null, error: null });
+  assert.deepEqual(selected, [], '进行中的快探不能被重复切换');
+  releaseWatch();
+  watchBlocked = false;
+  await activeWatch;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(selected, ['n1'], '快探结束后应补跑主动切换');
+});
+
+test('停止监控后不再执行排队中的快探', async () => {
+  let releaseWatch;
+  const gate = new Promise((resolve) => { releaseWatch = resolve; });
+  let reads = 0;
+  const api = makeApi({
+    getProxies: async () => {
+      reads += 1;
+      if (reads === 1) await gate;
+      return { proxies: selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1'])) };
+    },
+  });
+  const monitor = createMonitor({ api, config: { ...fastConfig, realProbeEnabled: false }, clock: makeClock(0), logger: makeLogger() });
+  const activeWatch = monitor.watchCycle();
+  await monitor.watchCycle();
+  monitor.stop();
+  releaseWatch();
+  await activeWatch;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 1, '停止后不应再次读取 Selector');
+});
+
 test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测通但真实不通）', async () => {
   let currentNow = 'n0';
   const proxies = () => selectorProxy(currentNow, ['n0', 'n1', 'n2'], leafTypes(['n0', 'n1', 'n2']));

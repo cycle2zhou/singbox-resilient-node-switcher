@@ -55,6 +55,8 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
   let candidateGeneration = 0;
   let running = false;
   let watchInProgress = false;
+  let watchRerunRequested = false;
+  let watchStopped = false;
   let poolInProgress = false;
   let watchTimer = null;
   let poolTimer = null;
@@ -467,6 +469,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
 
   async function watchCycle() {
     if (watchInProgress) {
+      watchRerunRequested = true;
       return { skipped: true, switchedTo: null, error: null };
     }
     watchInProgress = true;
@@ -638,11 +641,18 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       watchInProgress = false;
       watchController = null;
       watchCycleCount += 1;
+      if (watchRerunRequested) {
+        watchRerunRequested = false;
+        queueMicrotask(() => {
+          if (!watchStopped) watchCycle().catch((error) => log.error('补充快探轮次异常', error?.message || String(error)));
+        });
+      }
     }
   }
 
   function start() {
     if (running) return;
+    watchStopped = false;
     running = true;
     poolCycle().catch((error) => log.error('候选池预热异常', error?.message || String(error)));
     watchTimer = setInterval(() => {
@@ -655,6 +665,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
   }
 
   function stop() {
+    watchStopped = true;
     running = false;
     if (watchTimer) {
       clearInterval(watchTimer);
