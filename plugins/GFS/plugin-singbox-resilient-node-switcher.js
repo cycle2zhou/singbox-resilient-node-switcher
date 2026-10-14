@@ -535,6 +535,8 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
   let serial = 0;
   let active = null;
   let pending = null;
+  let waitingKey = null;
+  let waitingGeneration = null;
 
   function result(ok, fields = {}) { return { ok, ...fields }; }
 
@@ -549,6 +551,10 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     if (!before?.now) return result(false, { reason: 'current node unavailable', requestId, switchId });
     const priority = Number.isFinite(request?.priority) ? request.priority : (request?.reason === 'failure' ? 10 : 1);
     const snapshot = candidateStore.getSnapshot();
+    const currentKey = stableKey(before.now);
+    if (waitingKey === currentKey && waitingGeneration === (snapshot?.generation ?? null)) {
+      return result(false, { reason: 'no-available-node', requestId, switchId });
+    }
     const allowExpired = request?.reason === 'failure' || priority >= 10;
     const selection = candidateStore.getUsableCandidates({
       now: time.now(),
@@ -558,11 +564,18 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     if (!selection.candidates.length) {
       if (typeof fallback === 'function' && priority >= 10) {
         const fallbackTag = await fallback({ current: before.now, request, requestId, switchId });
-        if (typeof fallbackTag === 'string' && stableKey(fallbackTag) !== stableKey(before.now)) {
+        if (stableKey(fallbackTag) === stableKey(before.now)) {
+          waitingKey = currentKey;
+          waitingGeneration = snapshot?.generation ?? null;
+          return result(false, { reason: 'no-available-node', requestId, switchId });
+        }
+        if (typeof fallbackTag === 'string') {
           await selectNode(fallbackTag);
           const confirmed = await api.getProxies();
           const now = confirmed?.proxies?.[config.selectorName]?.now;
           if (stableKey(now) === stableKey(fallbackTag)) {
+            waitingKey = null;
+            waitingGeneration = null;
             await onNowConfirmed?.(now);
             await onConfirmed?.({ from: before.now, to: fallbackTag, requestId, switchId, at: time.now(), fallback: true });
             return result(true, { node: fallbackTag, requestId, switchId, fallback: true });
@@ -617,12 +630,19 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     }
     if (typeof fallback === 'function' && priority >= 10) {
       const fallbackTag = await fallback({ current: before.now, request, requestId, switchId });
-      if (typeof fallbackTag === 'string' && stableKey(fallbackTag) !== stableKey(before.now)) {
+      if (stableKey(fallbackTag) === stableKey(before.now)) {
+        waitingKey = currentKey;
+        waitingGeneration = snapshot?.generation ?? null;
+        return result(false, { reason: 'no-available-node', requestId, switchId });
+      }
+      if (typeof fallbackTag === 'string') {
         try {
           await selectNode(fallbackTag);
           const confirmed = await api.getProxies();
           const now = confirmed?.proxies?.[config.selectorName]?.now;
           if (stableKey(now) === stableKey(fallbackTag)) {
+            waitingKey = null;
+            waitingGeneration = null;
             await onNowConfirmed?.(now);
             await onConfirmed?.({ from: before.now, to: fallbackTag, requestId, switchId, at: time.now(), fallback: true });
             return result(true, { node: fallbackTag, requestId, switchId, fallback: true });
@@ -1086,7 +1106,8 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
       if (check.result.delay > cfg.realDelayMs) return { ok: false, delay: check.result.delay, reason: '真实延迟超过阈值' };
       return check.result;
     },
-    fallback: async ({ current }) => members.find((tag) => memberTypes[tag] === 'URLTest' && stableKey(tag) !== stableKey(current)) || null,
+    fallback: async ({ current }) => members.find((tag) => memberTypes[tag] === 'URLTest' && stableKey(tag) !== stableKey(current))
+      || (memberTypes[current] === 'URLTest' ? current : null),
     onNowConfirmed: async (now) => { currentNow = now; },
     onConfirmed: async ({ from, to, at, fallback }) => resetAfterConfirmedSwitch(from, to, at, fallback),
   });

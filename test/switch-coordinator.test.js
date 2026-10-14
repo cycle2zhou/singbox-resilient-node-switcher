@@ -155,6 +155,24 @@ test('候选快照存在但全部候选失败时仍使用 URLTest 兜底', async
   assert.deepEqual(options.calls.map(({ tag }) => tag), ['urltest']);
 });
 
+test('当前已在 URLTest 且无可用候选时保持不动并进入等待态', async () => {
+  const options = baseOptions();
+  options.setCurrent('urltest');
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([candidate('dead')]),
+    probeCandidate: async () => ({ ok: false, reason: 'unreachable' }),
+    fallback: async () => 'urltest',
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'no-available-node');
+  assert.deepEqual(options.calls, []);
+  const repeated = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(repeated.reason, 'no-available-node');
+  assert.deepEqual(options.calls, []);
+});
+
 test('外部 now 变化使事务失效，不继续提交切换成功', async () => {
   let observed = 'bad';
   const options = baseOptions({

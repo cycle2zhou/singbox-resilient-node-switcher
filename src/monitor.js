@@ -239,7 +239,8 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       if (check.result.delay > cfg.realDelayMs) return { ok: false, delay: check.result.delay, reason: '真实延迟超过阈值' };
       return check.result;
     },
-    fallback: async ({ current }) => members.find((tag) => memberTypes[tag] === 'URLTest' && stableKey(tag) !== stableKey(current)) || null,
+    fallback: async ({ current }) => members.find((tag) => memberTypes[tag] === 'URLTest' && stableKey(tag) !== stableKey(current))
+      || (memberTypes[current] === 'URLTest' ? current : null),
     onNowConfirmed: async (now) => { currentNow = now; },
     onConfirmed: async ({ from, to, at, fallback }) => resetAfterConfirmedSwitch(from, to, at, fallback),
   });
