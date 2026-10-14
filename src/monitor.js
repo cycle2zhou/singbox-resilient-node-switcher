@@ -1,5 +1,9 @@
 import { normalizeConfig } from './config.js';
 import { createNodeState } from './model.js';
+import { createCandidateStore } from './candidate-store.js';
+import { createTopologySnapshot, createCandidateSnapshot, createCorrelationId } from './runtime-model.js';
+import { createRuntimeState, applyRuntimeEvent } from './runtime-state.js';
+import { createSwitchCoordinator } from './switch-coordinator.js';
 import { realProbe } from './api.js';
 import {
   getProbePlan,
@@ -47,6 +51,8 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
   let lastError = null;
   let lastSwitch = null;
   let candidates = [];
+  const candidateStore = createCandidateStore({ clock: time });
+  let candidateGeneration = 0;
   let running = false;
   let watchInProgress = false;
   let poolInProgress = false;
@@ -54,6 +60,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
   let poolTimer = null;
   let watchController = null;
   let poolController = null;
+  let switchCoordinator = null;
 
   // 通道 A 专用状态
   let watchBaseline = [];
@@ -75,8 +82,16 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
   let realProbeGeneration = 0;
   let realProbeLastAt = 0;
   let realProbeTimer = null;
+  // 真实 GET 失败/超慢后请求一次立即快探；消费后清除，避免失败时反复重入。
+  let realSwitchRequested = false;
   // 事件时间线：内存环形队列，仅保留最近 eventLogLimit 条
   let eventLog = [];
+  let runtimeState = createRuntimeState();
+  let correlationCounter = 0;
+
+  function applyEvent(type, fields = {}) {
+    runtimeState = applyRuntimeEvent(runtimeState, { type, at: time.now(), ...fields });
+  }
 
   function ensureNodeState(tag) {
     if (!nodeStates.has(tag)) {
@@ -181,6 +196,52 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     }
   }
 
+  function resetAfterConfirmedSwitch(from, to, now, fallback = false) {
+    const oldState = ensureNodeState(from);
+    nodeStates.set(from, markCooldown(oldState, now, cfg));
+    lastSwitch = { from, to, at: now };
+    currentNow = to;
+    lastObservedNow = to;
+    currentStartAt = now;
+    watchBaseline = [];
+    watchFailureCount = 0;
+    watchDegradationCount = 0;
+    watchOptimizeCount = 0;
+    watchSlowCount = 0;
+    realSlowCount = 0;
+    realSwitchRequested = false;
+    realDelay = null;
+    stalking = true;
+    stalkingSuccessCount = 0;
+    realProbeGeneration += 1;
+    const switchId = createCorrelationId('switch', ++correlationCounter);
+    applyEvent('switch.succeeded', { from, to, switchId, requestId: switchId });
+    recordEvent('switch-confirmed', { from, to, fallback, switchId });
+    scheduleStalkProbe();
+  }
+
+  switchCoordinator = createSwitchCoordinator({
+    api,
+    config: cfg,
+    clock: time,
+    logger: log,
+    candidateStore,
+    observeCurrent: () => ({ now: currentNow }),
+    probeCandidate: async (tag, request = {}) => {
+      const check = await probeAny(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
+      return check;
+    },
+    realProbe: async (_tag, options = {}) => {
+      const check = await realProbeAny(cfg.realProbeUrls, options.timeoutMs || cfg.realStalkTimeoutMs);
+      if (!check.ok || !check.result) return { ok: false, reason: '真实探测失败' };
+      if (check.result.delay > cfg.realDelayMs) return { ok: false, delay: check.result.delay, reason: '真实延迟超过阈值' };
+      return check.result;
+    },
+    fallback: async ({ current }) => members.find((tag) => memberTypes[tag] === 'URLTest' && stableKey(tag) !== stableKey(current)) || null,
+    onNowConfirmed: async (now) => { currentNow = now; },
+    onConfirmed: async ({ from, to, at, fallback }) => resetAfterConfirmedSwitch(from, to, at, fallback),
+  });
+
   // 单飞真实探测：真实 GET 走系统代理读 body 测真实延迟，覆盖 sing-box HEAD 探测盲区。
   // 独立于 HEAD 快探周期、不阻塞 watchCycle；结果绑定 stableKey + generation，
   // 节点已变化/切换后返回的过期结果直接丢弃。
@@ -205,8 +266,10 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         realDelay = realResult.result.delay;
         if (realResult.result.delay > cfg.realDelayMs) {
           realSlowCount += 1;
+          if (realSlowCount >= cfg.realSlowThreshold) realSwitchRequested = true;
         } else {
           realSlowCount = 0;
+          realSwitchRequested = false;
           // 盯梢期：真实 GET 达标才累计，达到 realStalkSuccessThreshold 次退出盯梢
           if (stalking) {
             stalkingSuccessCount += 1;
@@ -221,6 +284,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       } else {
         realDelay = null;
         realSlowCount += 1;
+        if (realSlowCount >= cfg.realSlowThreshold) realSwitchRequested = true;
+      }
+      if (realSwitchRequested) {
+        recordEvent('real-probe-switch-requested', { key: targetKey, realSlowCount });
+        if (running) {
+          scheduleStalkProbe();
+        }
       }
       recordEvent('real-probe-result', { key: targetKey, generation, ok: realResult.ok, delay: realDelay, realSlowCount, stalking });
       return { skipped: false, stale: false, ok: realResult.ok };
@@ -367,6 +437,26 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         })
         .sort((a, b) => (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity));
 
+      const topology = createTopologySnapshot(members, memberTypes, currentNow, time.now());
+      candidateStore.setTopology(topology.topologyFingerprint);
+      const candidateSnapshot = createCandidateSnapshot({
+        generation: candidateGeneration + 1,
+        createdAt: time.now(),
+        expiresAt: time.now() + cfg.poolRefreshIntervalMs,
+        topologyFingerprint: topology.topologyFingerprint,
+        candidates: candidates.map((tag) => {
+          const state = nodeStates.get(tag);
+          return { tag, stableKey: stableKey(tag), delay: state.lastDelay, checkedAt: state.lastProbeAt ?? time.now() };
+        }),
+      });
+      if (candidateStore.publish(candidateSnapshot)) {
+        candidateGeneration = candidateSnapshot.generation;
+        const scanId = createCorrelationId('scan', ++correlationCounter);
+        applyEvent('candidate.published', { snapshot: candidateSnapshot });
+        applyEvent('scan.completed', { scanId, durationMs: 0, published: true });
+        recordEvent('scan-completed', { scanId, generation: candidateSnapshot.generation, candidateCount: candidates.length });
+      }
+
       return { skipped: false, error: null };
     } finally {
       poolInProgress = false;
@@ -424,6 +514,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         watchOptimizeCount = 0;
         watchSlowCount = 0;
         realSlowCount = 0;
+        realSwitchRequested = false;
         realDelay = null;
         realProbeGeneration += 1; // 使在途真实探测结果过期
         stalking = true;
@@ -504,7 +595,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       // 盯梢期内：失败 1 次即切、HEAD 高延迟 1 次即切、免驻留，尽快摆脱故障节点
       const effectiveFailureThreshold = stalking ? 1 : cfg.failureThreshold;
       const effectiveSlowThreshold = stalking ? 1 : cfg.slowThreshold;
-      const effectiveMinDwellMs = stalking ? 0 : cfg.minDwellMs;
+      const effectiveMinDwellMs = stalking || realSwitchRequested ? 0 : cfg.minDwellMs;
       const shouldSwitch = (watchFailureCount >= effectiveFailureThreshold)
         || (watchDegradationCount >= cfg.degradationThreshold)
         || (watchSlowCount >= effectiveSlowThreshold)
@@ -513,161 +604,33 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       const dwellSatisfied = now >= (currentStartAt ?? now) + effectiveMinDwellMs;
 
       if (shouldSwitch && dwellSatisfied) {
-        if (candidates.length === 0) {
-          // 候选池耗尽兜底：切到 URLTest 组（sing-box 自带 interval/tolerance 自动切换），
-          // 避免两次 poolCycle 之间候选池被清空后故障切换失败、卡死在死节点。
-          const urlTestGroup = members.find((tag) => memberTypes[tag] === 'URLTest');
-          if (urlTestGroup && stableKey(urlTestGroup) !== stableKey(observedNow)) {
-            try {
-              await api.select(cfg.selectorName, urlTestGroup, cycleController.signal);
-              const oldState = ensureNodeState(observedNow);
-              nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
-              lastSwitch = { from: observedNow, to: urlTestGroup, at: now };
-              currentNow = urlTestGroup;
-              lastObservedNow = urlTestGroup;
-              currentStartAt = now;
-              watchBaseline = [];
-              watchFailureCount = 0;
-              watchDegradationCount = 0;
-              watchOptimizeCount = 0;
-              watchSlowCount = 0;
-              realSlowCount = 0;
-              realDelay = null;
-              stalking = true;
-              stalkingSuccessCount = 0;
-              realProbeGeneration += 1; // 使在途真实探测结果过期
-              scheduleStalkProbe();
-              log.info(`候选池为空，已兜底切换到 URLTest 组 ${urlTestGroup}`);
-              return { skipped: false, switchedTo: urlTestGroup, error: null };
-            } catch (error) {
-              lastError = `候选池为空且切换到 URLTest 组失败: ${error?.message || String(error)}`;
-              log.error(lastError);
-              return { skipped: false, switchedTo: null, error: lastError };
-            }
-          }
-          lastError = '候选池为空，等待通道 B 刷新';
-          log.info(lastError);
-          return { skipped: false, switchedTo: null, error: lastError };
+        const coordinated = await switchCoordinator.requestSwitch({
+          reason: optimizeTriggered ? 'optimize' : 'failure',
+          priority: optimizeTriggered ? 1 : 10,
+          attempt: watchCycleCount,
+        });
+        if (coordinated.ok) {
+          return { skipped: false, switchedTo: coordinated.node, error: null };
         }
-
-        // tag 漂移下，候选池可能残留「当前节点」的旧/新后缀快照，切换前按稳定身份排除。
-        // 方案 B：复核与剔除只在本次切换的局部 candidatePool 上进行，不持久消耗模块级
-        // candidates，避免两次 poolCycle 之间候选池被「复核不可达」逐步耗尽清空。
-        let candidatePool = candidates.filter((t) => stableKey(t) !== stableKey(observedNow));
-
-        // 循环切换：切到候选后立即真实验证，真实失效则排除该候选继续切下一个，
-        // 最多尝试 preSwitchMaxProbe 个候选，避免「切到失效节点」陷入长判定等待
-        let attempts = 0;
-        while (candidatePool.length > 0 && attempts < cfg.preSwitchMaxProbe) {
-          attempts += 1;
-
-          // 并行复核前 preSwitchMaxProbe 个候选（已按延迟升序），取最快可达者
-          const probePool = candidatePool.slice(0, cfg.preSwitchMaxProbe);
-          const checks = await Promise.all(probePool.map(async (candidate) => {
-            const check = await probeAny(
-              candidate,
-              probeUrlSequence(watchCycleCount + attempts - 1),
-              cfg.watchTimeoutMs,
-              cycleController.signal,
-            );
-            return { candidate, ok: check.ok };
-          }));
-          const unreachable = new Set(checks.filter((c) => !c.ok).map((c) => c.candidate));
-          const reachable = checks.filter((c) => c.ok).map((c) => c.candidate);
-          if (unreachable.size > 0) {
-            candidatePool = candidatePool.filter((t) => !unreachable.has(t));
-            for (const c of unreachable) log.warn(`候选 ${c} 复核不可达，跳过`);
-          }
-          if (reachable.length === 0) {
-            lastError = '候选池内候选复核均不可达，等待通道 B 刷新';
-            log.warn(lastError);
-            return { skipped: false, switchedTo: null, error: lastError };
-          }
-          const target = reachable[0]; // probePool 已按延迟升序，第一个即最快可达
-
-          // 切换
-          try {
-            await api.select(cfg.selectorName, target, cycleController.signal);
-          } catch (error) {
-            log.warn(`切换到 ${target} 失败`, error?.message || String(error));
-            lastError = `switch failed: ${error?.message}`;
-            currentStartAt = now;
-            // 切换失败可能由节点或控制面瞬时问题引起，重置计数避免 failureCount 累积卡死
-            watchFailureCount = 0;
-            watchDegradationCount = 0;
-            watchOptimizeCount = 0;
-            watchSlowCount = 0;
-            realSlowCount = 0;
-            realDelay = null;
-            return { skipped: false, switchedTo: null, error: lastError };
-          }
-
-          // 刷新确认 now
-          let confirmNow = null;
-          try {
-            const refreshed = await api.getProxies(cycleController.signal);
-            confirmNow = refreshed?.proxies?.[cfg.selectorName]?.now ?? null;
-          } catch (error) {
-            confirmNow = null;
-          }
-
-          if (confirmNow !== null && stableKey(confirmNow) === stableKey(target)) {
-            // 切换后立即真实验证：真实 GET 读 body，识别「探测通但真实失效/超慢」的节点
-            let realOk = true;
-            if (cfg.realProbeEnabled) {
-              const realCheck = await realProbeAny(cfg.realProbeUrls, cfg.realStalkTimeoutMs);
-              realOk = realCheck.ok && realCheck.result && realCheck.result.delay <= cfg.realDelayMs;
-              if (!realOk) {
-                const realMs = realCheck.ok && realCheck.result ? realCheck.result.delay : null;
-                log.warn(`切换到 ${target} 后真实验证失败（真实延迟 ${realMs}ms），立即回退`);
-              }
-            }
-            if (!realOk) {
-              // 真实失效/超慢：标记 cooldown 排除该候选，继续循环切下一个
-              const targetState = ensureNodeState(target);
-              nodeStates.set(target, markCooldown(targetState, now, cfg));
-              candidatePool = candidatePool.filter((t) => stableKey(t) !== stableKey(target));
-              continue;
-            }
-
-            // 真实可用，正常进入盯梢期
-            const oldState = ensureNodeState(observedNow);
-            nodeStates.set(observedNow, markCooldown(oldState, now, cfg));
-            lastSwitch = { from: observedNow, to: target, at: now };
-            currentNow = target;
-            lastObservedNow = target;
-            currentStartAt = now;
-            watchBaseline = [];
-            watchFailureCount = 0;
-            watchDegradationCount = 0;
-            watchOptimizeCount = 0;
-            watchSlowCount = 0;
-            realSlowCount = 0;
-            realDelay = null;
-            stalking = true;
-            stalkingSuccessCount = 0;
-            realProbeGeneration += 1; // 使在途真实探测结果过期
-            scheduleStalkProbe();
-            log.info(`已切换到 ${target}`);
-            return { skipped: false, switchedTo: target, error: null };
-          }
-
-          log.warn(`切换确认失败：期望 now=${target} 实际 now=${confirmNow}`);
+        if (coordinated.reason === 'candidate snapshot unavailable') {
+          lastError = '候选池为空，等待通道 B 刷新';
+        } else if (coordinated.reason === 'all candidates failed') {
+          lastError = 'switch failed: all candidates failed';
+        } else if (coordinated.reason === 'switch confirmation failed') {
           lastError = 'switch confirm failed';
-          currentStartAt = now;
+        } else {
+          lastError = coordinated.reason || 'switch failed';
+        }
+        if (coordinated.reason !== 'candidate snapshot unavailable') {
           watchFailureCount = 0;
           watchDegradationCount = 0;
           watchOptimizeCount = 0;
           watchSlowCount = 0;
           realSlowCount = 0;
           realDelay = null;
-          return { skipped: false, switchedTo: null, error: lastError };
         }
-
-        // 循环耗尽：候选池内候选均真实失效或切换失败
-        lastError = '候选池内候选均切换失败，等待通道 B 刷新';
-        log.warn(lastError);
         return { skipped: false, switchedTo: null, error: lastError };
+
       }
 
       return { skipped: false, switchedTo: null, error: lastError };
@@ -716,6 +679,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     watchController = null;
     poolController?.abort();
     poolController = null;
+    switchCoordinator?.stop();
   }
 
   function getSnapshot() {
@@ -725,6 +689,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     }
     return {
       selectorName: cfg.selectorName,
+      revision: runtimeState.revision,
+      diagnostics: {
+        ...runtimeState.diagnostics,
+        candidateGeneration,
+        candidateCount: candidates.length,
+        lastSwitchId: runtimeState.lastSwitch?.switchId ?? null,
+      },
       running,
       watchInProgress,
       poolInProgress,

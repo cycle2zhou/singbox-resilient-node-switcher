@@ -485,6 +485,20 @@ test('PUT 成功但刷新后的 now 不等于目标时不报告切换成功', as
   );
 });
 
+test('运行快照包含单调 revision 与候选扫描诊断字段', async () => {
+  const api = makeApi({
+    getProxies: async () => ({ proxies: { ...selectorProxy('n0', ['n0', 'n1']), n0: { type: 'VLESS' }, n1: { type: 'VLESS' } } }),
+  });
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(), logger: makeLogger() });
+  const before = monitor.getSnapshot();
+  assert.equal(Number.isInteger(before.revision), true);
+  assert.equal(typeof before.diagnostics, 'object');
+  await monitor.poolCycle();
+  const after = monitor.getSnapshot();
+  assert.equal(after.revision > before.revision, true);
+  assert.equal(typeof after.diagnostics.lastScan, 'object');
+});
+
 test('watchCycle 不被池刷新阻塞且刷新完成前保留上一轮候选池', async () => {
   const tags = ['n0', 'n1', 'n2'];
   let currentNow = 'n0';
@@ -1044,6 +1058,35 @@ test('真实延迟探测：真实 GET 延迟未超过 realDelayMs 不触发切�
   assert.deepEqual(selected, [], '真实延迟未超阈值不应触发切换');
   assert.equal(monitor.getSnapshot().currentNow, 'n0');
   assert.equal(monitor.getSnapshot().channelA.realSlowCount, 0, '真实快时 realSlowCount 应为 0');
+});
+
+test('真实探测失败在驻留期内也能触发主动切换', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...DEFAULT_CONFIG, minDwellMs: 60000, realProbeEnabled: true, realProbeUrls: ['https://github.com'], realSlowThreshold: 1 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => {
+      if (currentNow === 'n0') throw new Error('network unreachable');
+      return { body: 'ok' };
+    },
+  });
+
+  await monitor.poolCycle();
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  await monitor.watchCycle();
+
+  assert.deepEqual(selected, ['n1'], '真实访问失败应绕过驻留期立即触发切换');
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
 });
 
 test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测通但真实不通）', async () => {

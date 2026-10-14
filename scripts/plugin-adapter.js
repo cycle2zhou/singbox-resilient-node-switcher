@@ -167,9 +167,6 @@ export default (Plugin) => {
       <template #title-suffix>
         <div class="font-bold">
           {{ isRunning ? '监控中' : '已停止' }} · 当前节点：{{ currentNow || '-' }}
-          <span v-if="lastSwitchText" style="margin-left: 8px; font-weight: normal">
-            · 上次切换 {{ lastSwitchText }}
-          </span>
         </div>
       </template>
       <template #extra>
@@ -244,16 +241,11 @@ export default (Plugin) => {
         const currentNow = computed(() => (snapshot.value ? snapshot.value.currentNow : null));
         const lastError = computed(() => (snapshot.value ? snapshot.value.lastError : null));
         const candidates = computed(() => (snapshot.value ? snapshot.value.candidates : []));
-        const lastSwitchText = computed(() => {
-          const ls = snapshot.value ? snapshot.value.lastSwitch : null;
-          return ls ? `${ls.from} → ${ls.to}` : '';
-        });
         return {
           isRunning,
           currentNow,
           lastError,
           candidates,
-          lastSwitchText,
           rows,
           columns,
           handleStart() {

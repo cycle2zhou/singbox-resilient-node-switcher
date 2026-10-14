@@ -15,7 +15,18 @@ const outDir = join(root, 'plugins', 'GFS');
 const outFile = join(outDir, 'plugin-singbox-resilient-node-switcher.js');
 
 // 内联顺序：被依赖者在前（拓扑序）
-const MODULE_ORDER = ['config.js', 'model.js', 'response.js', 'health-state.js', 'api.js', 'monitor.js'];
+const MODULE_ORDER = [
+  'config.js',
+  'model.js',
+  'response.js',
+  'health-state.js',
+  'runtime-model.js',
+  'candidate-store.js',
+  'runtime-state.js',
+  'switch-coordinator.js',
+  'api.js',
+  'monitor.js',
+];
 
 // 内联后暴露给适配层的公共 API
 const EXPORTS = [

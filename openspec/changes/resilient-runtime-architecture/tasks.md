@@ -15,8 +15,8 @@
 
 - [x] 3.1 新增 `src/switch-coordinator.js`，实现 `createSwitchCoordinator({api, config, clock, logger, candidateStore, observeCurrent, realProbe})` 和 `requestSwitch(request)`；所有候选复核、PUT、now 确认、真实验证、回退和 URLTest 兜底均在该模块完成，`api.select()` 只保留一个调用点。
 - [x] 3.2 新增 `test/switch-coordinator.test.js`，先固定请求去重、故障优先级、候选实时复核、PUT 后 now 不一致、真实验证失败回退、外部 now 变化使事务失效和 URLTest 兜底互斥。
-- [ ] 3.3 将候选过期规则、盯梢保护和择优抑制接入协调器；运行 `node --test test/switch-coordinator.test.js` 与 `grep` 检查生产代码仅有一个 `api.select(` 调用点。
-- [ ] 3.4 提交 `feat: centralize selector switch transactions`。
+- [x] 3.3 将候选过期规则、盯梢保护和择优抑制接入协调器；运行 `node --test test/switch-coordinator.test.js` 与 `grep` 检查生产代码仅有一个 `api.select(` 调用点。
+- [x] 3.4 提交 `feat: centralize selector switch transactions`。
 
 ## 4. 统一运行态与版本化持久化
 

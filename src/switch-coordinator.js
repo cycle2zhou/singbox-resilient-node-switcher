@@ -6,7 +6,7 @@ function stableKey(tag) {
   return match ? match[1].trim() : tag;
 }
 
-export function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candidateStore, observeCurrent, realProbe }) {
+export function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candidateStore, observeCurrent, realProbe, probeCandidate = null, fallback = null, onNowConfirmed = null, onConfirmed = null }) {
   if (!api || typeof api.select !== 'function' || typeof api.getProxies !== 'function') throw new TypeError('api select/getProxies are required');
   if (!candidateStore || typeof candidateStore.getSnapshot !== 'function') throw new TypeError('candidateStore is required');
   if (typeof observeCurrent !== 'function') throw new TypeError('observeCurrent is required');
@@ -18,6 +18,10 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
   let pending = null;
 
   function result(ok, fields = {}) { return { ok, ...fields }; }
+
+  async function selectNode(tag) {
+    return api.select(config.selectorName, tag);
+  }
 
   async function execute(request) {
     const requestId = createCorrelationId('request', ++serial);
@@ -33,6 +37,19 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
       allowExpired,
     });
     if (!selection.candidates.length) {
+      if (typeof fallback === 'function' && priority >= 10) {
+        const fallbackTag = await fallback({ current: before.now, request, requestId, switchId });
+        if (typeof fallbackTag === 'string' && stableKey(fallbackTag) !== stableKey(before.now)) {
+          await selectNode(fallbackTag);
+          const confirmed = await api.getProxies();
+          const now = confirmed?.proxies?.[config.selectorName]?.now;
+          if (stableKey(now) === stableKey(fallbackTag)) {
+            await onNowConfirmed?.(now);
+            await onConfirmed?.({ from: before.now, to: fallbackTag, requestId, switchId, at: time.now(), fallback: true });
+            return result(true, { node: fallbackTag, requestId, switchId, fallback: true });
+          }
+        }
+      }
       return result(false, { reason: 'candidate snapshot unavailable', requestId, switchId });
     }
     const candidates = selection.candidates
@@ -46,8 +63,12 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
         return result(false, { reason: 'current node changed', requestId, switchId });
       }
       try {
+        if (typeof probeCandidate === 'function') {
+          const probe = await probeCandidate(candidate.tag, request);
+          if (!probe?.ok) continue;
+        }
         // 唯一的 Selector PUT 调用点：切换后立即确认 now，再用真实 GET 验证目标。
-        await api.select(config.selectorName, candidate.tag);
+        await selectNode(candidate.tag);
         const confirmed = await api.getProxies();
         const now = confirmed?.proxies?.[config.selectorName]?.now;
         if (stableKey(now) !== stableKey(candidate.tag)) {
@@ -55,16 +76,21 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
           logger.warn?.(`switch confirmation mismatch: expected ${candidate.tag}, got ${now}`);
           continue;
         }
+        await onNowConfirmed?.(now);
         allowedCurrent = now;
-        const checked = await realProbe(candidate.tag, { timeoutMs: config.realStalkTimeoutMs ?? config.realProbeTimeoutMs });
-        if (!checked?.ok) {
-          logger.warn?.(`candidate real probe failed: ${candidate.tag}: ${checked?.reason || 'unknown'}`);
-          continue;
+        if (config.realProbeEnabled !== false) {
+          const checked = await realProbe(candidate.tag, { timeoutMs: config.realStalkTimeoutMs ?? config.realProbeTimeoutMs });
+          if (!checked?.ok) {
+            logger.warn?.(`candidate real probe failed: ${candidate.tag}: ${checked?.reason || 'unknown'}`);
+            continue;
+          }
         }
         const afterProbe = observeCurrent();
-        if (stableKey(afterProbe?.now) !== stableKey(allowedCurrent)) {
+        if (stableKey(afterProbe?.now) !== stableKey(before.now)
+          && stableKey(afterProbe?.now) !== stableKey(allowedCurrent)) {
           return result(false, { reason: 'current node changed', requestId, switchId });
         }
+        await onConfirmed?.({ from: before.now, to: candidate.tag, requestId, switchId, at: time.now(), fallback: false });
         return result(true, { node: candidate.tag, requestId, switchId, requiresRecheck: Boolean(selection.requiresRecheck) });
       } catch (error) {
         logger.warn?.(`switch candidate failed: ${candidate.tag}: ${error?.message || error}`);

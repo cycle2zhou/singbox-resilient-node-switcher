@@ -18,6 +18,19 @@ test('插件单文件可独立解析并导出默认工厂函数', async () => {
   assert.equal(typeof mod.default, 'function');
 });
 
+test('插件单文件包含运行时快照依赖定义，可在启动时创建 monitor', () => {
+  assert.match(pluginSource, /function createCandidateStore\s*\(/, '缺少 CandidateStore 内联实现');
+  assert.match(pluginSource, /function createTopologySnapshot\s*\(/, '缺少 runtime-model 内联实现');
+  assert.match(pluginSource, /function createCandidateSnapshot\s*\(/, '缺少候选快照内联实现');
+  assert.match(pluginSource, /function createRuntimeState\s*\(/, '缺少 runtime-state 内联实现');
+});
+
+test('生产插件只通过 SwitchCoordinator 调用 Selector PUT', () => {
+  assert.match(pluginSource, /function createSwitchCoordinator\s*\(/, '缺少 SwitchCoordinator 内联实现');
+  const directSelectCalls = pluginSource.match(/api\.select\(/g) || [];
+  assert.equal(directSelectCalls.length, 1, '生产插件应只有协调器中的一个 api.select 调用点');
+});
+
 test('插件源码不通过相对路径或运行时 import 引用项目 src/', () => {
   assert.doesNotMatch(pluginSource, /^\s*import\s/m, '不应包含 import 语句');
   assert.doesNotMatch(pluginSource, /import\s*\(/, '不应包含动态 import');
@@ -102,6 +115,12 @@ test('元数据配置项齐全且默认值与 src/config.js 一致', () => {
   assert.ok(realProbeEnabled, '缺少配置项 RealProbeEnabled');
   assert.equal(realProbeEnabled.component, 'Switch', 'RealProbeEnabled 应为 Switch');
   assert.equal(realProbeEnabled.value, DEFAULT_CONFIG.realProbeEnabled, 'RealProbeEnabled 默认值应与 src/config.js 一致');
+});
+
+test('插件界面不展示切换路径但保留内部状态字段', () => {
+  assert.match(pluginSource, /lastSwitch:/, '内部快照应保留 lastSwitch 诊断字段');
+  assert.doesNotMatch(pluginSource, /lastSwitchText/, '界面不应暴露长切换路径文本');
+  assert.doesNotMatch(pluginSource, /上次切换|切换路径/, '界面不应展示切换路径标题');
 });
 
 test('插件源码读取全部双通道配置键', () => {

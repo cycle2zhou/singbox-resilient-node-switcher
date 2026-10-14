@@ -51,6 +51,43 @@ test('同一当前节点的并发故障请求只产生一个切换事务', async
   assert.equal(options.calls.length, 1);
 });
 
+test('真实探测关闭时协调器仍完成候选切换且不调用真实探测', async () => {
+  let realProbeCalls = 0;
+  const options = baseOptions({
+    config: { selectorName: 'selector', preSwitchMaxProbe: 1, realProbeEnabled: false },
+    realProbe: async () => { realProbeCalls += 1; return { ok: false, reason: 'should not run' }; },
+  });
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('good')]) });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'good');
+  assert.equal(realProbeCalls, 0);
+});
+
+test('候选即时复核失败后跳过首候选并切换下一个', async () => {
+  const options = baseOptions({
+    probeCandidate: async (tag) => tag === 'bad-good' ? { ok: false } : { ok: true },
+  });
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('bad-good', 1), candidate('good', 2)]) });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'good');
+  assert.deepEqual(options.calls.map(({ tag }) => tag), ['good']);
+});
+
+test('成功切换后提交统一确认事件', async () => {
+  const events = [];
+  const options = baseOptions();
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([candidate('good')]),
+    onConfirmed: async (event) => events.push(event),
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(events.map(({ from, to, fallback }) => ({ from, to, fallback })), [{ from: 'bad', to: 'good', fallback: false }]);
+});
+
 test('候选真实复核失败后回退到下一个候选', async () => {
   const options = baseOptions({
     realProbe: async (tag) => tag === 'bad-good' ? { ok: false, reason: 'unreachable' } : { ok: true, delay: 10 },
@@ -87,6 +124,20 @@ test('PUT 后 now 不一致时不报告伪成功', async () => {
   const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'switch confirmation failed');
+});
+
+test('候选快照为空时协调器使用 URLTest 兜底且返回成功节点', async () => {
+  const options = baseOptions();
+  const store = makeStore([], { topologyFingerprint: 'topology-1' });
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: store,
+    fallback: async ({ current }) => current === 'bad' ? 'urltest' : null,
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'urltest');
+  assert.deepEqual(options.calls.map(({ tag }) => tag), ['urltest']);
 });
 
 test('外部 now 变化使事务失效，不继续提交切换成功', async () => {
