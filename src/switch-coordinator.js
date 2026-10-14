@@ -96,6 +96,23 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
         logger.warn?.(`switch candidate failed: ${candidate.tag}: ${error?.message || error}`);
       }
     }
+    if (typeof fallback === 'function' && priority >= 10) {
+      const fallbackTag = await fallback({ current: before.now, request, requestId, switchId });
+      if (typeof fallbackTag === 'string' && stableKey(fallbackTag) !== stableKey(before.now)) {
+        try {
+          await selectNode(fallbackTag);
+          const confirmed = await api.getProxies();
+          const now = confirmed?.proxies?.[config.selectorName]?.now;
+          if (stableKey(now) === stableKey(fallbackTag)) {
+            await onNowConfirmed?.(now);
+            await onConfirmed?.({ from: before.now, to: fallbackTag, requestId, switchId, at: time.now(), fallback: true });
+            return result(true, { node: fallbackTag, requestId, switchId, fallback: true });
+          }
+        } catch (error) {
+          logger.warn?.(`fallback switch failed: ${fallbackTag}: ${error?.message || error}`);
+        }
+      }
+    }
     return result(false, { reason: confirmationFailed ? 'switch confirmation failed' : 'all candidates failed', requestId, switchId });
   }
 

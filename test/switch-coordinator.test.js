@@ -140,6 +140,21 @@ test('候选快照为空时协调器使用 URLTest 兜底且返回成功节点',
   assert.deepEqual(options.calls.map(({ tag }) => tag), ['urltest']);
 });
 
+test('候选快照存在但全部候选失败时仍使用 URLTest 兜底', async () => {
+  const options = baseOptions({
+    probeCandidate: async () => ({ ok: false, reason: 'unreachable' }),
+  });
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([candidate('stale-good')]),
+    fallback: async ({ current }) => current === 'bad' ? 'urltest' : null,
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'urltest');
+  assert.deepEqual(options.calls.map(({ tag }) => tag), ['urltest']);
+});
+
 test('外部 now 变化使事务失效，不继续提交切换成功', async () => {
   let observed = 'bad';
   const options = baseOptions({
