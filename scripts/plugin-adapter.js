@@ -41,6 +41,7 @@ export default (Plugin) => {
         : [],
       watchIntervalMs: Number(Plugin.WatchIntervalMs),
       watchTimeoutMs: Number(Plugin.WatchTimeoutMs),
+      maxDelayMs: Number(Plugin.MaxDelayMs),
       poolRefreshIntervalMs: Number(Plugin.PoolRefreshIntervalMs),
       poolTimeoutMs: Number(Plugin.PoolTimeoutMs),
       poolConcurrency: Number(Plugin.PoolConcurrency),
@@ -52,9 +53,58 @@ export default (Plugin) => {
       minDwellMs: Number(Plugin.MinDwellMs),
       degradationRatio: Number(Plugin.DegradationRatio),
       degradationThreshold: Number(Plugin.DegradationThreshold),
+      slowThreshold: Number(Plugin.SlowThreshold),
       baselineWindow: Number(Plugin.BaselineWindow),
       optimizeRatio: Number(Plugin.OptimizeRatio),
       optimizeThreshold: Number(Plugin.OptimizeThreshold),
+      stalkProbeDelayMs: Number(Plugin.StalkProbeDelayMs),
+      stalkSuccessThreshold: Number(Plugin.StalkSuccessThreshold),
+      preSwitchMaxProbe: Number(Plugin.PreSwitchMaxProbe),
+      realProbeEnabled: Plugin.RealProbeEnabled,
+      realProbeUrls: typeof Plugin.RealProbeUrls === 'string'
+        ? Plugin.RealProbeUrls.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      realDelayMs: Number(Plugin.RealDelayMs),
+      realProbeMinSuccesses: Number(Plugin.RealProbeMinSuccesses),
+      realProbeTimeoutMs: Number(Plugin.RealProbeTimeoutMs),
+      realStalkTimeoutMs: Number(Plugin.RealStalkTimeoutMs),
+      realSlowThreshold: Number(Plugin.RealSlowThreshold),
+      realProbeIntervalMs: Number(Plugin.RealProbeIntervalMs),
+      realStalkSuccessThreshold: Number(Plugin.RealStalkSuccessThreshold),
+      eventLogLimit: Number(Plugin.EventLogLimit),
+      scanIntervalMs: Number(Plugin.ScanIntervalMs),
+      scanMainPoolSize: Number(Plugin.ScanMainPoolSize),
+      scanExplorePoolSize: Number(Plugin.ScanExplorePoolSize),
+      scanScoreMax: Number(Plugin.ScanScoreMax),
+      scanScoreInitial: Number(Plugin.ScanScoreInitial),
+      scanScoreHighThreshold: Number(Plugin.ScanScoreHighThreshold),
+      scanScoreMediumThreshold: Number(Plugin.ScanScoreMediumThreshold),
+      scanScoreLowThreshold: Number(Plugin.ScanScoreLowThreshold),
+      scanBackoffRounds: Number(Plugin.ScanBackoffRounds),
+      scanSuccessStep: Number(Plugin.ScanSuccessStep),
+      scanFailureStep: Number(Plugin.ScanFailureStep),
+      scanHttp503Step: Number(Plugin.ScanHttp503Step),
+      scanHttp504Step: Number(Plugin.ScanHttp504Step),
+      scanTimeoutStep: Number(Plugin.ScanTimeoutStep),
+      scanRealFailureStep: Number(Plugin.ScanRealFailureStep),
+      scanSlowStep: Number(Plugin.ScanSlowStep),
+      foregroundReserved: Number(Plugin.ForegroundReserved),
+      backgroundConcurrency: Number(Plugin.BackgroundConcurrency),
+      backgroundBatchSize: Number(Plugin.BackgroundBatchSize),
+      backgroundRoundDeadlineMs: Number(Plugin.BackgroundRoundDeadlineMs),
+      backgroundBackoffMs: Number(Plugin.BackgroundBackoffMs),
+      stabilityMode: Plugin.StabilityMode,
+      stabilityWindowMs: Number(Plugin.StabilityWindowMs),
+      stabilityMaxSamples: Number(Plugin.StabilityMaxSamples),
+      stabilityHeadMinSamples: Number(Plugin.StabilityHeadMinSamples),
+      stabilityRealMinSamples: Number(Plugin.StabilityRealMinSamples),
+      stabilityRealLatencyMinSamples: Number(Plugin.StabilityRealLatencyMinSamples),
+      realStabilityProbeBudget: Number(Plugin.RealStabilityProbeBudget),
+      stableSwitchRounds: Number(Plugin.StableSwitchRounds),
+      stabilitySwitchMargin: Number(Plugin.StabilitySwitchMargin),
+      latencySwitchMargin: Number(Plugin.LatencySwitchMargin),
+      optimizeDwellMs: Number(Plugin.OptimizeDwellMs),
+      optimizeCooldownMs: Number(Plugin.OptimizeCooldownMs),
     };
   }
 
@@ -110,6 +160,10 @@ export default (Plugin) => {
       api: apiClient,
       config,
       clock: Date,
+      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）。
+      // 传 Connection: close 强制每次新建连接（含 TLS 握手），避免 Go http.Client 复用连接
+      // 跳过 TLS 握手导致延迟系统性低估（实测复用连接 ~0.7s vs 新建连接 1.7~4.6s）。
+      httpGetImpl: (url) => Plugins.HttpGet(url, { Connection: 'close' }),
       logger: {
         info: (...args) => console.log(`[${Plugin.name}]`, ...args),
         warn: (...args) => console.warn(`[${Plugin.name}]`, ...args),
@@ -147,9 +201,6 @@ export default (Plugin) => {
       <template #title-suffix>
         <div class="font-bold">
           {{ isRunning ? '监控中' : '已停止' }} · 当前节点：{{ currentNow || '-' }}
-          <span v-if="lastSwitchText" style="margin-left: 8px; font-weight: normal">
-            · 上次切换 {{ lastSwitchText }}
-          </span>
         </div>
       </template>
       <template #extra>
@@ -224,16 +275,11 @@ export default (Plugin) => {
         const currentNow = computed(() => (snapshot.value ? snapshot.value.currentNow : null));
         const lastError = computed(() => (snapshot.value ? snapshot.value.lastError : null));
         const candidates = computed(() => (snapshot.value ? snapshot.value.candidates : []));
-        const lastSwitchText = computed(() => {
-          const ls = snapshot.value ? snapshot.value.lastSwitch : null;
-          return ls ? `${ls.from} → ${ls.to}` : '';
-        });
         return {
           isRunning,
           currentNow,
           lastError,
           candidates,
-          lastSwitchText,
           rows,
           columns,
           handleStart() {
@@ -266,6 +312,12 @@ export default (Plugin) => {
   return {
     onRun() {
       createUI().open();
+    },
+    onStartup() {
+      return start();
+    },
+    onReady() {
+      return start();
     },
     onCoreStarted() {
       try {

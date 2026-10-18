@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createClashApi } from '../src/api.js';
+import { createClashApi, realProbe } from '../src/api.js';
 
 function response(status, body) {
   return {
@@ -183,4 +183,39 @@ test('探测超时交给 sing-box timeout 参数，fetch 端兜底超时不提�
   assert.equal(result.ok, false);
   assert.match(result.reason, /504/);
   assert.doesNotMatch(result.reason, /timeout|abort/i);
+});
+
+test('realProbe 用 httpGetImpl 真实下载 body 并返回完整延迟', async () => {
+  // httpGetImpl（HttpGet 风格）真实下载响应体，延迟应反映完整下载时间
+  const httpGetImpl = async (url) => {
+    assert.equal(url, 'https://github.com');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return { body: '<html>ok</html>' };
+  };
+  const result = await realProbe('https://github.com', 1000, httpGetImpl);
+  assert.equal(result.ok, true);
+  assert.ok(result.delay >= 25 && result.delay < 200, `delay 应反映下载耗时，实际 ${result.delay}`);
+});
+
+test('realProbe body 含 message（GitHub API 错误）返回失败', async () => {
+  const httpGetImpl = async () => ({ body: { message: 'API rate limit exceeded' } });
+  const result = await realProbe('https://github.com', 1000, httpGetImpl);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /rate limit/);
+});
+
+test('realProbe 网络错误抛异常返回失败', async () => {
+  const httpGetImpl = async () => { throw new Error('network unreachable'); };
+  const result = await realProbe('https://github.com', 1000, httpGetImpl);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /network unreachable/);
+});
+
+test('realProbe 超时归类为 request timeout', async () => {
+  // httpGetImpl 无超时参数，realProbe 用软超时兜底
+  const httpGetImpl = async () => new Promise((resolve) => setTimeout(() => resolve({ body: 'ok' }), 100));
+  const result = await realProbe('https://github.com', 20, httpGetImpl);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /timeout/i);
+  assert.doesNotMatch(result.reason, /abort/i);
 });
