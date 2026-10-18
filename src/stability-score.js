@@ -2,7 +2,8 @@ function finite(value) {
   return Number.isFinite(value);
 }
 
-function clone(value) {
+function cloneStabilityScore(value) {
+  if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value));
 }
 
@@ -20,7 +21,7 @@ function median(values) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-function normalizeConfig(config = {}) {
+function normalizeStabilityConfig(config = {}) {
   return {
     stabilityWindowMs: Number.isFinite(config.stabilityWindowMs) && config.stabilityWindowMs > 0 ? config.stabilityWindowMs : 600000,
     stabilityMaxSamples: Number.isInteger(config.stabilityMaxSamples) && config.stabilityMaxSamples > 0 ? config.stabilityMaxSamples : 20,
@@ -31,7 +32,7 @@ function normalizeConfig(config = {}) {
 }
 
 export function createStabilityScore({ config = {}, clock = Date } = {}) {
-  const cfg = normalizeConfig(config);
+  const cfg = normalizeStabilityConfig(config);
   const nodes = new Map();
 
   function ensure(stableKey) {
@@ -101,14 +102,14 @@ export function createStabilityScore({ config = {}, clock = Date } = {}) {
     getAllSummaries,
     isEligible: (stableKey, now = clock.now()) => getSummary(stableKey, now)?.eligibility === 'eligible',
     compare: (left, right) => (left?.score ?? -1) - (right?.score ?? -1),
-    snapshot: () => clone([...nodes.values()]),
+    snapshot: () => cloneStabilityScore([...nodes.values()]),
     restore: (snapshot) => {
       if (!Array.isArray(snapshot) || snapshot.some((node) => !node || typeof node.stableKey !== 'string' || !Array.isArray(node.head) || !Array.isArray(node.real))) {
         nodes.clear();
         return false;
       }
       nodes.clear();
-      for (const node of snapshot) nodes.set(node.stableKey, clone(node));
+      for (const node of snapshot) nodes.set(node.stableKey, cloneStabilityScore(node));
       return true;
     },
   };

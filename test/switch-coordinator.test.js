@@ -86,6 +86,9 @@ test('成功切换后提交统一确认事件', async () => {
   const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
   assert.equal(result.ok, true);
   assert.deepEqual(events.map(({ from, to, fallback }) => ({ from, to, fallback })), [{ from: 'bad', to: 'good', fallback: false }]);
+  assert.equal(events[0].reason, 'failure');
+  assert.equal(events[0].requestId, result.requestId);
+  assert.equal(events[0].switchId, result.switchId);
 });
 
 test('候选真实复核失败后回退到下一个候选', async () => {
@@ -100,6 +103,21 @@ test('候选真实复核失败后回退到下一个候选', async () => {
   assert.deepEqual(options.calls.map(({ tag }) => tag), ['bad-good', 'good']);
 });
 
+test('同一故障事务不会重复尝试已失败的候选', async () => {
+  const options = baseOptions({
+    realProbe: async (tag) => tag === 'bad-good' ? { ok: false, reason: 'unreachable' } : { ok: true, delay: 10 },
+    fallback: async () => 'urltest',
+  });
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([candidate('bad-good', 1), candidate('bad-good', 1)]),
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'urltest');
+  assert.deepEqual(options.calls.map(({ tag }) => tag), ['bad-good', 'urltest']);
+});
+
 test('择优请求拒绝过期快照，故障请求允许过期候选但仍需实时复核', async () => {
   const options = baseOptions({ clock: { now: () => 2000 } });
   const store = makeStore([candidate('good')], { now: 0, expiresAt: 1000 });
@@ -109,6 +127,38 @@ test('择优请求拒绝过期快照，故障请求允许过期候选但仍需�
   assert.equal(optimize.reason, 'candidate snapshot unavailable');
   const failure = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
   assert.equal(failure.ok, true);
+});
+
+test('故障事务诊断记录过期快照与候选实时复核结果', async () => {
+  const diagnostics = [];
+  const options = baseOptions({
+    clock: { now: () => 2000 },
+    probeCandidate: async () => ({ ok: false, reason: 'unreachable' }),
+    onDiagnostic: async (event) => diagnostics.push(event),
+  });
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([candidate('bad-good')], { now: 0, expiresAt: 1000 }),
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, false);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(diagnostics[0], {
+    type: 'switch-diagnostic',
+    requestId: result.requestId,
+    switchId: result.switchId,
+    reason: 'failure',
+    priority: 10,
+    candidateGeneration: 1,
+    allowExpired: true,
+    requiresRecheck: true,
+    candidateCount: 1,
+    recheckedCount: 1,
+    successfulCount: 0,
+    failedCount: 1,
+    fallbackAttempted: false,
+    result: 'all-candidates-failed',
+  });
 });
 
 test('PUT 后 now 不一致时不报告伪成功', async () => {
@@ -124,6 +174,25 @@ test('PUT 后 now 不一致时不报告伪成功', async () => {
   const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'switch confirmation failed');
+});
+
+test('URLTest 兜底确认事件保留故障优先级并标记无候选复核', async () => {
+  const events = [];
+  const options = baseOptions();
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([]),
+    fallback: async ({ current }) => current === 'bad' ? 'urltest' : null,
+    onConfirmed: async (event) => events.push(event),
+  });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].reason, 'failure');
+  assert.equal(events[0].priority, 10);
+  assert.equal(events[0].candidateGeneration, null);
+  assert.equal(events[0].candidateDelay, null);
+  assert.equal(events[0].candidateRecheck, false);
 });
 
 test('候选快照为空时协调器使用 URLTest 兜底且返回成功节点', async () => {

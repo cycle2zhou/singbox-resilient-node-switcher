@@ -28,7 +28,8 @@
 | `src/response.js` | 延迟探测响应解析（正数 delay 才算成功） |
 | `src/health-state.js` | 可恢复健康状态机（纯时间参数，无系统时钟依赖） |
 | `src/api.js` | sing-box Clash API 客户端（超时/取消/错误模型） |
-| `src/monitor.js` | Selector 监控、并发受限探测与切换确认 |
+| `src/monitor.js` | Selector 监控、评分调度、并发受限探测与切换确认 |
+| `src/scan-policy.js` | 独立软评分、主池/探索池预算、退避与恢复探测策略 |
 | `scripts/plugin-adapter.js` | GUI.for.SingBox 插件胶水（生命周期、配置、状态 UI） |
 | `scripts/build-plugin.js` | 零第三方依赖的内联构建脚本 |
 | `plugins/gfs.json` | Plugin-Hub 元数据 |
@@ -39,7 +40,7 @@
 | 通道 | 节奏 | 探测对象 | 职责 |
 | --- | --- | --- | --- |
 | 通道 A · 快探 | 每 `WatchIntervalMs` | 仅当前节点 `now` | 连续失败或延迟劣化达阈值 → 触发切换三段式 |
-| 通道 B · 候选池 | 每 `PoolRefreshIntervalMs` | 除当前节点与 URLTest 外的全部成员 | 并发受限（`PoolConcurrency`）扫描，产出健康候选池 `candidates` |
+| 通道 B · 候选池 | 每 `ScanIntervalMs` | 按软评分分段调度的叶子成员；当前候选和恢复目标强制优先 | 主池/探索池预算受限，并发受限（`PoolConcurrency`）扫描；完整成功后原子更新健康候选池 `candidates` |
 
 切换三段式（候选已按延迟升序排序，恒切最快）：切换前**并行复核**候选（最多 `PreSwitchMaxProbe` 个，跳过不可达者）→ `PUT /proxies/{selector}` 切换 → 刷新 `/proxies` 确认 `now` 指向目标节点。确认后**立即真实验证**（若开启 `RealProbeEnabled`，真实 GET 读 body）：真实失效/超慢则标记该候选冷却、继续切下一个候选（循环最多 `PreSwitchMaxProbe` 次），避免「切到失效节点」陷入长判定等待。切换成功后对被切走节点执行 `markCooldown`（进入冷却，`InitialCooldownMs` 内不重新成为候选），并设最短驻留 `MinDwellMs` 防止乒乓；随后进入盯梢期：`StalkProbeDelayMs` 后快探新节点，失败 1 次即快速切走（盯梢期免驻留），连续成功 `StalkSuccessThreshold` 次后退出盯梢、恢复正常阈值。
 
@@ -85,12 +86,32 @@
 | 真实延迟探测 | `RealProbeEnabled` | `true` | sing-box 的 `/delay` 用 HEAD 且不读 body，系统性低估真实 GET 延迟（实测低 3~6 倍）；开启后用 fetch 走系统代理发起真实 GET 读 body 补盲区 |
 | 真实探测 URL 列表 | `RealProbeUrls` | `https://github.com,https://www.google.com` | 真实延迟探测目标地址，逗号分隔；全部探测取最慢延迟，至少一个成功才判健康 |
 | 真实延迟阈值(ms) | `RealDelayMs` | `3000` | 真实 GET 延迟超过该值即计「慢」 |
+| 真实探测最少成功 URL 数 | `RealProbeMinSuccesses` | `2` | 至少多少个真实探测 URL 成功才视为当前节点可达，超过 URL 数量时自动限制 |
 | 真实探测超时(ms) | `RealProbeTimeoutMs` | `8000` | 单次真实 GET 探测的超时 |
 | 盯梢期真实探测超时(ms) | `RealStalkTimeoutMs` | `3000` | 切换后盯梢期（快速检测）的真实 GET 探测超时，更短以便尽快发现慢节点再切 |
-| 真实慢连续次数 | `RealSlowThreshold` | `1` | 真实 GET 连续多少次超阈值（或全部失败）后触发切换 |
+| 真实慢连续次数 | `RealSlowThreshold` | `2` | 真实 GET 连续多少次超阈值（或全部失败）后触发切换 |
 | 真实探测间隔(ms) | `RealProbeIntervalMs` | `15000` | 正常期真实 GET 探测的间隔；盯梢期自动缩短以尽快确认新节点 |
 | 盯梢退出真实达标次数 | `RealStalkSuccessThreshold` | `2` | 切换后新节点真实 GET 连续达标多少次才退出盯梢期；HEAD 快但真实慢的节点不会提前退出 |
 | 事件时间线条数 | `EventLogLimit` | `50` | 内存中保留的最近事件条数（环形队列），用于诊断 |
+| 扫描调度间隔(ms) | `ScanIntervalMs` | `10000` | 评分扫描定时任务间隔 |
+| 前台保留并发 | `ForegroundReserved` | `2` | 为当前节点探测和切换验证保留的请求额度 |
+| 后台扫描并发/批次 | `BackgroundConcurrency` / `BackgroundBatchSize` | `3` / `3` | 后台每批最多启动的节点请求数，避免占满前台连接资源 |
+| 后台轮次上限(ms) | `BackgroundRoundDeadlineMs` | `300000` | 后台一轮扫描的软截止时间，超时保留旧候选并退避 |
+| 后台超时退避(ms) | `BackgroundBackoffMs` | `30000` | 后台轮次超时后的等待时间 |
+| 评分主池大小 | `ScanMainPoolSize` | `20` | 每轮按评分优先扫描的节点数 |
+| 评分探索池大小 | `ScanExplorePoolSize` | `5` | 每轮从主池外轮转恢复探测的节点数 |
+| 初始分/评分上限 | `ScanScoreInitial` / `ScanScoreMax` | `80` / `100` | 软评分边界；评分只控制后台扫描，不替代健康状态机 |
+| 评分阈值 | `ScanScoreHighThreshold` / `ScanScoreMediumThreshold` / `ScanScoreLowThreshold` | `90` / `80` / `70` | 高分每轮、中分每2轮、低分每3轮；更低分按 `ScanBackoffRounds`（默认6轮）退避 |
+| 探测加分 | `ScanSuccessStep` | `5` | 成功探测增加评分，最高不超过评分上限 |
+| 探测扣分 | `ScanFailureStep` / `ScanHttp503Step` / `ScanHttp504Step` / `ScanTimeoutStep` | `15` / `10` / `15` / `20` | 普通失败、503、504、超时分别扣分 |
+| 真实探测扣分 | `ScanRealFailureStep` / `ScanSlowStep` | `25` / `5` | 真实 GET 失败或真实访问过慢时扣分 |
+| 择优模式 | `StabilityMode` | `stable-first` | 稳定优先抑制瞬时低延迟震荡，也可设为 `latency-first` |
+| 稳定性窗口/样本上限 | `StabilityWindowMs` / `StabilityMaxSamples` | `600000` / `20` | 稳定性样本保留窗口与每节点每类样本上限 |
+| 稳定性最低样本 | `StabilityHeadMinSamples` / `StabilityRealMinSamples` / `StabilityRealLatencyMinSamples` | `5` / `3` / `5` | 稳定优先择优的 HEAD、真实 GET 和成功延迟资格门槛 |
+| 候选真实探测预算 | `RealStabilityProbeBudget` | `3` | 每轮最多补充真实 GET 样本的候选数量，缺样本不伪造评分 |
+| 稳定择优连续轮数 | `StableSwitchRounds` | `3` | 候选连续满足稳定条件多少轮后才允许择优 |
+| 稳定分/延迟门槛 | `StabilitySwitchMargin` / `LatencySwitchMargin` | `8` / `0.35` | 稳定分差或延迟改善比例门槛 |
+| 择优驻留/失败冷却 | `OptimizeDwellMs` / `OptimizeCooldownMs` | `300000` / `600000` | 仅约束性能择优，不阻塞故障切换 |
 
 ## 状态机
 

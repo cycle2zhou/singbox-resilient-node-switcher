@@ -1,4 +1,4 @@
-function clone(value) {
+function cloneRuntimeState(value) {
   if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value));
 }
@@ -7,12 +7,12 @@ export function createRuntimeState(initial = {}) {
   return {
     revision: Number.isInteger(initial.revision) && initial.revision >= 0 ? initial.revision : 0,
     currentNow: initial.currentNow ?? null,
-    lastSwitch: clone(initial.lastSwitch) ?? null,
-    lastError: clone(initial.lastError) ?? null,
-    candidateSnapshot: clone(initial.candidateSnapshot) ?? null,
-    nodeStates: clone(initial.nodeStates) ?? {},
+    lastSwitch: cloneRuntimeState(initial.lastSwitch) ?? null,
+    lastError: cloneRuntimeState(initial.lastError) ?? null,
+    candidateSnapshot: cloneRuntimeState(initial.candidateSnapshot) ?? null,
+    nodeStates: cloneRuntimeState(initial.nodeStates) ?? {},
     stalking: Boolean(initial.stalking),
-    diagnostics: clone(initial.diagnostics) ?? {},
+    diagnostics: cloneRuntimeState(initial.diagnostics) ?? {},
   };
 }
 
@@ -28,6 +28,11 @@ export function applyRuntimeEvent(state, event) {
       to: event.to ?? null,
       switchId: event.switchId ?? null,
       requestId: event.requestId ?? null,
+      reason: event.reason ?? 'unknown',
+      priority: event.priority ?? null,
+      candidateGeneration: event.candidateGeneration ?? null,
+      candidateDelay: event.candidateDelay ?? null,
+      candidateRecheck: event.candidateRecheck ?? false,
     };
     next.lastError = null;
   } else if (event.type === 'switch.failed') {
@@ -40,9 +45,9 @@ export function applyRuntimeEvent(state, event) {
       published: Boolean(event.published),
     };
   } else if (event.type === 'candidate.published') {
-    next.candidateSnapshot = clone(event.snapshot) ?? null;
+    next.candidateSnapshot = cloneRuntimeState(event.snapshot) ?? null;
   } else if (event.type === 'node.state') {
-    if (typeof event.tag === 'string') next.nodeStates[event.tag] = clone(event.nodeState);
+    if (typeof event.tag === 'string') next.nodeStates[event.tag] = cloneRuntimeState(event.nodeState);
   } else if (event.type === 'stalking.changed') {
     next.stalking = Boolean(event.stalking);
   }

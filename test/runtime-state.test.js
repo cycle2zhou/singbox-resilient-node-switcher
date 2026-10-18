@@ -14,7 +14,18 @@ test('成功切换事件同时更新 currentNow 和 lastSwitch，并递增 revis
   });
   assert.equal(next.revision, 1);
   assert.equal(next.currentNow, 'new');
-  assert.deepEqual(next.lastSwitch, { at: 100, from: 'old', to: 'new', switchId: 'switch-1', requestId: 'request-1' });
+  assert.deepEqual(next.lastSwitch, {
+    at: 100,
+    from: 'old',
+    to: 'new',
+    switchId: 'switch-1',
+    requestId: 'request-1',
+    reason: 'unknown',
+    priority: null,
+    candidateGeneration: null,
+    candidateDelay: null,
+    candidateRecheck: false,
+  });
   assert.equal(initial.currentNow, 'old');
 });
 

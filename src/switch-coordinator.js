@@ -6,7 +6,7 @@ function stableKey(tag) {
   return match ? match[1].trim() : tag;
 }
 
-export function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candidateStore, observeCurrent, realProbe, probeCandidate = null, fallback = null, onNowConfirmed = null, onConfirmed = null }) {
+export function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candidateStore, observeCurrent, realProbe, probeCandidate = null, fallback = null, onNowConfirmed = null, onConfirmed = null, onDiagnostic = null }) {
   if (!api || typeof api.select !== 'function' || typeof api.getProxies !== 'function') throw new TypeError('api select/getProxies are required');
   if (!candidateStore || typeof candidateStore.getSnapshot !== 'function') throw new TypeError('candidateStore is required');
   if (typeof observeCurrent !== 'function') throw new TypeError('observeCurrent is required');
@@ -58,8 +58,29 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
             waitingKey = null;
             waitingGeneration = null;
             await onNowConfirmed?.(now);
-            await onConfirmed?.({ from: before.now, to: fallbackTag, requestId, switchId, at: time.now(), fallback: true });
-            return result(true, { node: fallbackTag, requestId, switchId, fallback: true });
+            await onConfirmed?.({
+              from: before.now,
+              to: fallbackTag,
+              requestId,
+              switchId,
+              reason: request?.reason ?? 'unknown',
+              priority,
+              candidateGeneration: null,
+              candidateDelay: null,
+              candidateRecheck: false,
+              at: time.now(),
+              fallback: true,
+            });
+            return result(true, {
+              node: fallbackTag,
+              requestId,
+              switchId,
+              fallback: true,
+              priority,
+              candidateGeneration: null,
+              candidateDelay: null,
+              candidateRecheck: false,
+            });
           }
         }
       }
@@ -68,17 +89,49 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
     const candidates = selection.candidates
       .filter((candidate) => stableKey(candidate.tag) !== stableKey(before.now))
       .slice(0, Number(config?.preSwitchMaxProbe) || selection.candidates.length);
+    const candidateGeneration = snapshot?.generation ?? null;
+    let recheckedCount = 0;
+    let successfulCount = 0;
+    let failedCount = 0;
+    let fallbackAttempted = false;
+    const emitDiagnostic = async (outcome) => {
+      await onDiagnostic?.({
+        type: 'switch-diagnostic',
+        requestId,
+        switchId,
+        reason: request?.reason ?? 'unknown',
+        priority,
+        candidateGeneration,
+        allowExpired,
+        requiresRecheck: Boolean(selection.requiresRecheck),
+        candidateCount: candidates.length,
+        recheckedCount,
+        successfulCount,
+        failedCount,
+        fallbackAttempted,
+        result: outcome,
+      });
+    };
+    const priorityValue = priority;
     let allowedCurrent = before.now;
     let confirmationFailed = false;
+    const failedCandidateKeys = new Set();
     for (const candidate of candidates) {
+      const candidateKey = stableKey(candidate.tag);
+      if (failedCandidateKeys.has(candidateKey)) continue;
       const observed = observeCurrent();
       if (stableKey(observed?.now) !== stableKey(allowedCurrent)) {
         return result(false, { reason: 'current node changed', requestId, switchId });
       }
       try {
         if (typeof probeCandidate === 'function') {
+          recheckedCount += 1;
           const probe = await probeCandidate(candidate.tag, request);
-          if (!probe?.ok) continue;
+          if (!probe?.ok) {
+            failedCount += 1;
+            failedCandidateKeys.add(candidateKey);
+            continue;
+          }
         }
         // 唯一的 Selector PUT 调用点：切换后立即确认 now，再用真实 GET 验证目标。
         await selectNode(candidate.tag);
@@ -91,9 +144,11 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
         }
         await onNowConfirmed?.(now);
         allowedCurrent = now;
+        successfulCount += 1;
         if (config.realProbeEnabled !== false) {
           const checked = await realProbe(candidate.tag, { timeoutMs: config.realStalkTimeoutMs ?? config.realProbeTimeoutMs });
           if (!checked?.ok) {
+            failedCandidateKeys.add(candidateKey);
             logger.warn?.(`candidate real probe failed: ${candidate.tag}: ${checked?.reason || 'unknown'}`);
             continue;
           }
@@ -103,13 +158,35 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
           && stableKey(afterProbe?.now) !== stableKey(allowedCurrent)) {
           return result(false, { reason: 'current node changed', requestId, switchId });
         }
-        await onConfirmed?.({ from: before.now, to: candidate.tag, requestId, switchId, at: time.now(), fallback: false });
-        return result(true, { node: candidate.tag, requestId, switchId, requiresRecheck: Boolean(selection.requiresRecheck) });
+        await onConfirmed?.({
+          from: before.now,
+          to: candidate.tag,
+          requestId,
+          switchId,
+          reason: request?.reason ?? 'unknown',
+          priority: priorityValue,
+          candidateGeneration,
+          candidateDelay: candidate.delay ?? null,
+          candidateRecheck: true,
+          at: time.now(),
+          fallback: false,
+        });
+        return result(true, {
+          node: candidate.tag,
+          requestId,
+          switchId,
+          requiresRecheck: Boolean(selection.requiresRecheck),
+          priority: priorityValue,
+          candidateGeneration,
+          candidateDelay: candidate.delay ?? null,
+          candidateRecheck: true,
+        });
       } catch (error) {
         logger.warn?.(`switch candidate failed: ${candidate.tag}: ${error?.message || error}`);
       }
     }
     if (typeof fallback === 'function' && priority >= 10) {
+      fallbackAttempted = true;
       const fallbackTag = await fallback({ current: before.now, request, requestId, switchId });
       if (stableKey(fallbackTag) === stableKey(before.now)) {
         waitingKey = currentKey;
@@ -125,14 +202,36 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
             waitingKey = null;
             waitingGeneration = null;
             await onNowConfirmed?.(now);
-            await onConfirmed?.({ from: before.now, to: fallbackTag, requestId, switchId, at: time.now(), fallback: true });
-            return result(true, { node: fallbackTag, requestId, switchId, fallback: true });
+            await onConfirmed?.({
+              from: before.now,
+              to: fallbackTag,
+              requestId,
+              switchId,
+              reason: request?.reason ?? 'unknown',
+              priority,
+              candidateGeneration: null,
+              candidateDelay: null,
+              candidateRecheck: false,
+              at: time.now(),
+              fallback: true,
+            });
+            return result(true, {
+              node: fallbackTag,
+              requestId,
+              switchId,
+              fallback: true,
+              priority,
+              candidateGeneration: null,
+              candidateDelay: null,
+              candidateRecheck: false,
+            });
           }
         } catch (error) {
           logger.warn?.(`fallback switch failed: ${fallbackTag}: ${error?.message || error}`);
         }
       }
     }
+    await emitDiagnostic(confirmationFailed ? 'confirmation-failed' : 'all-candidates-failed');
     return result(false, { reason: confirmationFailed ? 'switch confirmation failed' : 'all candidates failed', requestId, switchId });
   }
 

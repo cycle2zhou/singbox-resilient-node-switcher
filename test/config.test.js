@@ -38,13 +38,40 @@ test('normalizeConfig({}) 返回规格中的 31 项默认配置', () => {
     'https://www.google.com',
   ]);
   assert.equal(config.realDelayMs, 3000);
+  assert.equal(config.realProbeMinSuccesses, 2);
   assert.equal(config.realProbeTimeoutMs, 8000);
   assert.equal(config.realStalkTimeoutMs, 3000);
-  assert.equal(config.realSlowThreshold, 1);
+  assert.equal(config.realSlowThreshold, 2);
   assert.equal(config.realProbeIntervalMs, 15000);
   assert.equal(config.realStalkSuccessThreshold, 2);
   assert.equal(config.eventLogLimit, 50);
+  assert.equal(config.scanIntervalMs, 10000);
+  assert.equal(config.scanMainPoolSize, 20);
+  assert.equal(config.scanExplorePoolSize, 5);
+  assert.equal(config.scanScoreInitial, 80);
   assert.deepEqual(config, DEFAULT_CONFIG);
+});
+
+test('前后台调度参数提供默认值并接受正数配置', () => {
+  const defaults = normalizeConfig({});
+  assert.equal(defaults.foregroundReserved, 2);
+  assert.equal(defaults.backgroundConcurrency, 3);
+  assert.equal(defaults.backgroundBatchSize, 3);
+  assert.equal(defaults.backgroundRoundDeadlineMs, 300000);
+  assert.equal(defaults.backgroundBackoffMs, 30000);
+
+  const configured = normalizeConfig({
+    foregroundReserved: 1,
+    backgroundConcurrency: 4,
+    backgroundBatchSize: 5,
+    backgroundRoundDeadlineMs: 120000,
+    backgroundBackoffMs: 45000,
+  });
+  assert.equal(configured.foregroundReserved, 1);
+  assert.equal(configured.backgroundConcurrency, 4);
+  assert.equal(configured.backgroundBatchSize, 5);
+  assert.equal(configured.backgroundRoundDeadlineMs, 120000);
+  assert.equal(configured.backgroundBackoffMs, 45000);
 });
 
 test('normalizeConfig 安全归一化非法负数和零值', () => {
@@ -173,6 +200,21 @@ test('并发、阈值和窗口配置只接受正整数', () => {
   assert.equal(valid.eventLogLimit, 10);
 });
 
+test('评分阈值关系非法时回退默认值', () => {
+  const config = normalizeConfig({
+    scanScoreMax: 50,
+    scanScoreInitial: 90,
+    scanScoreHighThreshold: 70,
+    scanScoreMediumThreshold: 80,
+    scanScoreLowThreshold: 85,
+  });
+  assert.equal(config.scanScoreMax, DEFAULT_CONFIG.scanScoreMax);
+  assert.equal(config.scanScoreInitial, DEFAULT_CONFIG.scanScoreInitial);
+  assert.equal(config.scanScoreHighThreshold, DEFAULT_CONFIG.scanScoreHighThreshold);
+  assert.equal(config.scanScoreMediumThreshold, DEFAULT_CONFIG.scanScoreMediumThreshold);
+  assert.equal(config.scanScoreLowThreshold, DEFAULT_CONFIG.scanScoreLowThreshold);
+});
+
 test('poolFailureRateThreshold 只接受 (0,1] 区间内的有限数字', () => {
   assert.equal(normalizeConfig({}).poolFailureRateThreshold, DEFAULT_CONFIG.poolFailureRateThreshold);
   assert.equal(normalizeConfig({ poolFailureRateThreshold: 0.5 }).poolFailureRateThreshold, 0.5);
@@ -228,6 +270,27 @@ test('realProbeUrls 只接受非空字符串数组并保留用户值', () => {
     const config = normalizeConfig({ realProbeUrls: value });
     assert.deepEqual(config.realProbeUrls, DEFAULT_CONFIG.realProbeUrls, `realProbeUrls 应拒绝 ${JSON.stringify(value)}`);
   }
+});
+
+test('稳定性择优返回完整默认配置并安全归一化', () => {
+  const config = normalizeConfig({});
+  assert.equal(config.stabilityMode, 'stable-first');
+  assert.equal(config.stabilityWindowMs, 600000);
+  assert.equal(config.stabilityMaxSamples, 20);
+  assert.equal(config.stabilityHeadMinSamples, 5);
+  assert.equal(config.stabilityRealMinSamples, 3);
+  assert.equal(config.stabilityRealLatencyMinSamples, 5);
+  assert.equal(config.realStabilityProbeBudget, 3);
+  assert.equal(config.stableSwitchRounds, 3);
+  assert.equal(config.stabilitySwitchMargin, 8);
+  assert.equal(config.latencySwitchMargin, 0.35);
+  assert.equal(config.optimizeDwellMs, 300000);
+  assert.equal(config.optimizeCooldownMs, 600000);
+  const invalid = normalizeConfig({ stabilityWindowMs: 0, stabilityMaxSamples: 0, realStabilityProbeBudget: -1, stabilityMode: 'bad' });
+  assert.equal(invalid.stabilityWindowMs, 600000);
+  assert.equal(invalid.stabilityMaxSamples, 20);
+  assert.equal(invalid.realStabilityProbeBudget, 3);
+  assert.equal(invalid.stabilityMode, 'stable-first');
 });
 
 test('realProbeEnabled 只接受布尔值', () => {

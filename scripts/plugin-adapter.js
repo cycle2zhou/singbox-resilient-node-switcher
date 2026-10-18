@@ -65,12 +65,46 @@ export default (Plugin) => {
         ? Plugin.RealProbeUrls.split(',').map((s) => s.trim()).filter(Boolean)
         : [],
       realDelayMs: Number(Plugin.RealDelayMs),
+      realProbeMinSuccesses: Number(Plugin.RealProbeMinSuccesses),
       realProbeTimeoutMs: Number(Plugin.RealProbeTimeoutMs),
       realStalkTimeoutMs: Number(Plugin.RealStalkTimeoutMs),
       realSlowThreshold: Number(Plugin.RealSlowThreshold),
       realProbeIntervalMs: Number(Plugin.RealProbeIntervalMs),
       realStalkSuccessThreshold: Number(Plugin.RealStalkSuccessThreshold),
       eventLogLimit: Number(Plugin.EventLogLimit),
+      scanIntervalMs: Number(Plugin.ScanIntervalMs),
+      scanMainPoolSize: Number(Plugin.ScanMainPoolSize),
+      scanExplorePoolSize: Number(Plugin.ScanExplorePoolSize),
+      scanScoreMax: Number(Plugin.ScanScoreMax),
+      scanScoreInitial: Number(Plugin.ScanScoreInitial),
+      scanScoreHighThreshold: Number(Plugin.ScanScoreHighThreshold),
+      scanScoreMediumThreshold: Number(Plugin.ScanScoreMediumThreshold),
+      scanScoreLowThreshold: Number(Plugin.ScanScoreLowThreshold),
+      scanBackoffRounds: Number(Plugin.ScanBackoffRounds),
+      scanSuccessStep: Number(Plugin.ScanSuccessStep),
+      scanFailureStep: Number(Plugin.ScanFailureStep),
+      scanHttp503Step: Number(Plugin.ScanHttp503Step),
+      scanHttp504Step: Number(Plugin.ScanHttp504Step),
+      scanTimeoutStep: Number(Plugin.ScanTimeoutStep),
+      scanRealFailureStep: Number(Plugin.ScanRealFailureStep),
+      scanSlowStep: Number(Plugin.ScanSlowStep),
+      foregroundReserved: Number(Plugin.ForegroundReserved),
+      backgroundConcurrency: Number(Plugin.BackgroundConcurrency),
+      backgroundBatchSize: Number(Plugin.BackgroundBatchSize),
+      backgroundRoundDeadlineMs: Number(Plugin.BackgroundRoundDeadlineMs),
+      backgroundBackoffMs: Number(Plugin.BackgroundBackoffMs),
+      stabilityMode: Plugin.StabilityMode,
+      stabilityWindowMs: Number(Plugin.StabilityWindowMs),
+      stabilityMaxSamples: Number(Plugin.StabilityMaxSamples),
+      stabilityHeadMinSamples: Number(Plugin.StabilityHeadMinSamples),
+      stabilityRealMinSamples: Number(Plugin.StabilityRealMinSamples),
+      stabilityRealLatencyMinSamples: Number(Plugin.StabilityRealLatencyMinSamples),
+      realStabilityProbeBudget: Number(Plugin.RealStabilityProbeBudget),
+      stableSwitchRounds: Number(Plugin.StableSwitchRounds),
+      stabilitySwitchMargin: Number(Plugin.StabilitySwitchMargin),
+      latencySwitchMargin: Number(Plugin.LatencySwitchMargin),
+      optimizeDwellMs: Number(Plugin.OptimizeDwellMs),
+      optimizeCooldownMs: Number(Plugin.OptimizeCooldownMs),
     };
   }
 
@@ -278,6 +312,12 @@ export default (Plugin) => {
   return {
     onRun() {
       createUI().open();
+    },
+    onStartup() {
+      return start();
+    },
+    onReady() {
+      return start();
     },
     onCoreStarted() {
       try {

@@ -153,6 +153,13 @@ test('通道 A 只探当前 now，连续失败达到 failureThreshold 后从 can
   const snap = monitor.getSnapshot();
   assert.equal(snap.currentNow, 'n1');
   assert.equal(snap.nodeStates['n0'].status, 'cooldown');
+  assert.equal(snap.lastSwitch.reason, 'failure');
+  assert.match(snap.lastSwitch.requestId, /^request-/);
+  assert.match(snap.lastSwitch.switchId, /^switch-/);
+  assert.equal(snap.lastSwitch.priority, 10);
+  assert.equal(snap.lastSwitch.candidateGeneration, 1);
+  assert.equal(snap.lastSwitch.candidateDelay, 10);
+  assert.equal(snap.lastSwitch.candidateRecheck, true);
 });
 
 test('通道 A 延迟劣化：基线满后实时延迟>中位数×ratio 连续 2 次触发切换', async () => {
@@ -497,6 +504,69 @@ test('运行快照包含单调 revision 与候选扫描诊断字段', async () =
   const after = monitor.getSnapshot();
   assert.equal(after.revision > before.revision, true);
   assert.equal(typeof after.diagnostics.lastScan, 'object');
+  assert.equal(typeof after.diagnostics.scan, 'object');
+  assert.equal(after.diagnostics.scan.targetCount, 1);
+  assert.equal(after.diagnostics.scan.round, 1);
+  assert.equal(after.diagnostics.scan.durationMs >= 0, true);
+});
+
+test('运行快照暴露候选快照代次、有效期、拓扑与协调器可用数', async () => {
+  const api = makeApi({
+    getProxies: async () => ({ proxies: { ...selectorProxy('n0', ['n0', 'n1']), n0: { type: 'VLESS' }, n1: { type: 'VLESS' } } }),
+  });
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(), logger: makeLogger() });
+  await monitor.poolCycle();
+  const snapshot = monitor.getSnapshot();
+  const candidateDiagnostics = snapshot.diagnostics.candidateSnapshot;
+  assert.equal(Number.isInteger(candidateDiagnostics.generation), true);
+  assert.equal(typeof candidateDiagnostics.expiresAt, 'number');
+  assert.equal(typeof candidateDiagnostics.topologyFingerprint, 'string');
+  assert.equal(candidateDiagnostics.usableCandidateCount, 1);
+  assert.equal(candidateDiagnostics.requiresRecheck, false);
+  assert.equal(candidateDiagnostics.rejectionReason, null);
+});
+
+test('当前节点的 HEAD 与真实 GET 结果进入稳定性摘要', async () => {
+  let realCalls = 0;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1'])) }),
+    probe: async () => ({ ok: true, delay: 120 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realProbeUrls: ['https://probe.test'], realProbeIntervalMs: 1 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => { realCalls += 1; return { body: 'ok' }; },
+  });
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  const stability = monitor.getSnapshot().diagnostics.stability;
+  assert.equal(realCalls, 1);
+  assert.equal(stability.current.headSamples, 1);
+  assert.equal(stability.current.realSamples, 1);
+  assert.equal(stability.current.eligibility, 'insufficient-real-samples');
+});
+
+test('未成为当前节点的候选不执行临时切换真实探测并保持样本不足', async () => {
+  const tags = ['n0', 'n1', 'n2', 'n3', 'n4', 'n5'];
+  let realCalls = 0;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy('n0', tags, leafTypes(tags)) }),
+    probe: async (tag) => ({ ok: true, delay: tag === 'n0' ? 1000 : 100 + Number(tag.slice(1)) }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realStabilityProbeBudget: 3, realProbeUrls: ['https://probe.test'] },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => { realCalls += 1; return { body: 'ok' }; },
+  });
+  await monitor.poolCycle();
+  const stability = monitor.getSnapshot().diagnostics.stability;
+  assert.equal(realCalls, 0);
+  assert.equal(stability.candidateProbes, 0);
+  assert.ok(stability.candidates.every((summary) => summary.eligibility === 'insufficient-real-samples'));
 });
 
 test('watchCycle 不被池刷新阻塞且刷新完成前保留上一轮候选池', async () => {
@@ -528,6 +598,384 @@ test('watchCycle 不被池刷新阻塞且刷新完成前保留上一轮候选池
   await refresh;
   assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2'], '刷新完成后应原子替换候选池');
   assert.equal(monitor.getSnapshot().poolInProgress, false);
+});
+
+test('后台扫描尚未发布新快照时，故障切换仍可使用上一轮候选', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  let currentNow = 'n0';
+  let releaseProbe;
+  let probeStarted;
+  let blockRefresh = false;
+  const blockedProbe = new Promise((resolve) => { releaseProbe = resolve; });
+  const started = new Promise((resolve) => { probeStarted = resolve; });
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, tags, leafTypes(tags)) }),
+    probe: async (tag) => {
+      if (tag === 'n1' && blockRefresh) {
+        probeStarted();
+        return blockedProbe;
+      }
+      return { ok: true, delay: tag === 'n2' ? 20 : 10 };
+    },
+    select: async (_group, tag) => { currentNow = tag; return { ok: true }; },
+  });
+  const monitor = createMonitor({ api, config: { ...fastConfig, poolConcurrency: 1 }, clock: makeClock(), logger: makeLogger() });
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  blockRefresh = true;
+  const refresh = monitor.poolCycle();
+  await started;
+  const result = await monitor.watchCycle();
+  assert.equal(result.error, null);
+  assert.equal(result.switchedTo, null);
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+  releaseProbe({ ok: true, delay: 10 });
+  await refresh;
+});
+
+test('后台扫描可能超过刷新间隔时，候选快照保持到轮次截止后再过期', async () => {
+  const tags = ['n0', 'n1'];
+  let currentNow = 'n0';
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, tags, leafTypes(tags)) }),
+    probe: async (tag) => tag === 'n0' ? { ok: false, reason: 'timeout' } : { ok: true, delay: 10 },
+    select: async (_group, tag) => { currentNow = tag; return { ok: true }; },
+  });
+  const clock = makeClock();
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, poolRefreshIntervalMs: 100, backgroundRoundDeadlineMs: 500 },
+    clock,
+    logger: makeLogger(),
+  });
+  await monitor.poolCycle();
+  clock.advance(150);
+  const snapshot = monitor.getSnapshot().diagnostics.candidateSnapshot;
+  assert.equal(snapshot.rejectionReason, null, JSON.stringify(snapshot));
+});
+
+test('旧候选快照已过期且后台扫描未完成时，故障切换仍实时复核旧候选', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  let currentNow = 'n0';
+  let reads = 0;
+  let blockRefresh = false;
+  let releaseProbe;
+  let probeStarted;
+  const blockedProbe = new Promise((resolve) => { releaseProbe = resolve; });
+  const started = new Promise((resolve) => { probeStarted = resolve; });
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, tags, leafTypes(tags)) }),
+    probe: async (tag) => {
+      if (tag === 'n2' && blockRefresh) {
+        probeStarted();
+        return blockedProbe;
+      }
+      if (tag === 'n0') return { ok: false, reason: 'timeout' };
+      return { ok: true, delay: tag === 'n1' ? 10 : 20 };
+    },
+    select: async (_group, tag) => { currentNow = tag; return { ok: true }; },
+  });
+  const clock = makeClock();
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, poolConcurrency: 1, failureThreshold: 2, minDwellMs: 1, poolRefreshIntervalMs: 100 },
+    clock,
+    logger: makeLogger(),
+  });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+  await monitor.watchCycle();
+  clock.advance(101);
+  blockRefresh = true;
+  const refresh = monitor.poolCycle();
+  await started;
+  const result = await monitor.watchCycle();
+  const snapshot = monitor.getSnapshot();
+  releaseProbe({ ok: true, delay: 10 });
+  await refresh;
+  assert.equal(result.switchedTo, 'n1', JSON.stringify({ result, snapshot }));
+});
+
+test('后台扫描拓扑变化但尚未发布新快照时，故障切换仍使用旧候选', async () => {
+  const oldTags = ['n0', 'n1', 'n2'];
+  const newTags = ['n0', 'n1', 'n2', 'n3'];
+  let currentNow = 'n0';
+  let reads = 0;
+  let releaseProbe;
+  let probeStarted;
+  const blockedProbe = new Promise((resolve) => { releaseProbe = resolve; });
+  const started = new Promise((resolve) => { probeStarted = resolve; });
+  const api = makeApi({
+    getProxies: async () => ({
+      proxies: selectorProxy(currentNow, reads++ === 0 ? oldTags : newTags, leafTypes(reads === 1 ? oldTags : newTags)),
+    }),
+    probe: async (tag) => {
+      if (tag === 'n2' && reads > 1) {
+        probeStarted();
+        return blockedProbe;
+      }
+      if (tag === 'n0') return { ok: false, reason: 'timeout' };
+      return { ok: true, delay: 20 };
+    },
+    select: async (_group, tag) => { currentNow = tag; return { ok: true }; },
+  });
+  const clock = makeClock();
+  const monitor = createMonitor({ api, config: { ...fastConfig, poolConcurrency: 1, failureThreshold: 1, minDwellMs: 1 }, clock, logger: makeLogger() });
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  const refresh = monitor.poolCycle();
+  await probeStarted;
+  await monitor.watchCycle();
+  clock.advance(2);
+  const result = await monitor.watchCycle();
+  assert.equal(result.error, null);
+  assert.equal(result.switchedTo, 'n1', JSON.stringify({ result, snapshot: monitor.getSnapshot() }));
+  releaseProbe({ ok: true, delay: 20 });
+  await refresh;
+});
+
+test('前台 Selector 读取长期挂起时按 watch 超时释放额度', async () => {
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const api = makeApi({
+    getProxies: async () => blocked,
+    probe: async () => ({ ok: true, delay: 10 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, watchTimeoutMs: 20 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+  const startedAt = Date.now();
+  const result = await monitor.watchCycle();
+  const elapsed = Date.now() - startedAt;
+  assert.match(result.error, /watch|Selector|timeout/i);
+  assert.ok(elapsed < 200, `前台 Selector 读取未按超时退出：${elapsed}ms`);
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.foregroundInFlight, 0);
+  release({ proxies: {} });
+});
+
+test('前台节点探测长期挂起时按 watch 超时释放额度', async () => {
+  const proxies = selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async () => new Promise(() => {}),
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, watchTimeoutMs: 20 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+  const startedAt = Date.now();
+  const result = await monitor.watchCycle();
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result.error, null);
+  assert.ok(elapsed < 200, `前台节点探测未按超时退出：${elapsed}ms`);
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.foregroundInFlight, 0);
+  assert.equal(monitor.getSnapshot().watchInProgress, false);
+});
+
+test('后台扫描读取 Selector 前就占用后台轮次预算', async () => {
+  let releaseSelector;
+  let selectorStarted;
+  const selectorBlocked = new Promise((resolve) => {
+    selectorStarted = () => resolve();
+  });
+  const selectorResponse = selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
+  const monitor = createMonitor({
+    api: makeApi({
+      getProxies: async () => {
+        selectorStarted();
+        return new Promise((resolve) => { releaseSelector = () => resolve({ proxies: selectorResponse }); });
+      },
+    }),
+    config: { ...fastConfig, backgroundRoundDeadlineMs: 1000 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+
+  const cycle = monitor.poolCycle();
+  await selectorBlocked;
+  assert.equal(monitor.getSnapshot().poolInProgress, true);
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.backgroundInProgress, true);
+  releaseSelector();
+  await cycle;
+});
+
+test('后台扫描的 Selector 读取也受整轮截止时间约束', async () => {
+  const monitor = createMonitor({
+    api: makeApi({
+      getProxies: async () => new Promise(() => {}),
+    }),
+    config: { ...fastConfig, backgroundRoundDeadlineMs: 20 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+
+  const cycle = monitor.poolCycle();
+  await Promise.race([
+    cycle,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('pool cycle exceeded deadline')), 200)),
+  ]);
+  const snapshot = monitor.getSnapshot();
+  assert.equal(snapshot.poolInProgress, false);
+  assert.equal(snapshot.diagnostics.scheduler.backgroundInProgress, false);
+});
+
+test('后台扫描等待前台额度时，轮次截止仍能退出', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+  let probeCalls = 0;
+  let firstBatchDone;
+  const firstBatch = new Promise((resolve) => { firstBatchDone = resolve; });
+  let releaseWatch;
+  const watchBlocked = new Promise((resolve) => { releaseWatch = resolve; });
+  let getProxiesCalls = 0;
+  const api = makeApi({
+    getProxies: async () => {
+      getProxiesCalls += 1;
+      if (getProxiesCalls > 1) return watchBlocked;
+      return { proxies };
+    },
+    probe: async () => {
+      probeCalls += 1;
+      if (probeCalls === 1) firstBatchDone();
+      return { ok: true, delay: 10 };
+    },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, backgroundBatchSize: 1, backgroundRoundDeadlineMs: 20 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+
+  const pool = monitor.poolCycle();
+  await firstBatch;
+  const watch = monitor.watchCycle();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.race([
+    pool,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('后台等待前台额度时未按截止时间退出')), 200)),
+  ]);
+  releaseWatch({ proxies });
+  await watch;
+  assert.equal(monitor.getSnapshot().poolInProgress, false);
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.backgroundInProgress, false);
+});
+
+test('后台扫描诊断记录批次耗时、游标和超时阶段', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  let releaseProbe;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy('n0', tags, leafTypes(tags)) }),
+    probe: async (tag) => {
+      if (tag === 'n1') return new Promise((resolve) => { releaseProbe = resolve; });
+      return { ok: true, delay: 10 };
+    },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, backgroundBatchSize: 1, backgroundRoundDeadlineMs: 20 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+  const cycle = monitor.poolCycle();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  releaseProbe({ ok: true, delay: 10 });
+  await cycle;
+  const scheduler = monitor.getSnapshot().diagnostics.scheduler;
+  assert.equal(typeof scheduler.lastBatch.startedAt, 'number');
+  assert.equal(typeof scheduler.lastBatch.durationMs, 'number');
+  assert.equal(typeof scheduler.lastBatch.cursor, 'number');
+  assert.equal(typeof scheduler.lastBatch.foregroundWaitMs, 'number');
+  assert.equal(typeof scheduler.lastTimeoutReason, 'string');
+});
+
+test('后台扫描失败时不泄漏未发布的拓扑状态', async () => {
+  let cycle = 0;
+  const oldProxies = selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
+  const newProxies = selectorProxy('n1', ['n1', 'n2'], leafTypes(['n1', 'n2']));
+  const api = makeApi({
+    getProxies: async () => {
+      cycle += 1;
+      return { proxies: cycle === 1 ? oldProxies : newProxies };
+    },
+    probe: async (node, _url, _timeout, signal) => {
+      if (cycle > 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (signal?.aborted) return { ok: false, reason: 'aborted' };
+      return { ok: true, delay: node === 'n1' ? 10 : 20 };
+    },
+  });
+  const config = {
+    ...fastConfig,
+    backgroundRoundDeadlineMs: 20,
+    poolConcurrency: 1,
+    poolBatchSize: 1,
+  };
+  const monitor = createMonitor({ api, config, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle();
+  const before = monitor.getSnapshot();
+  assert.deepEqual(before.members, ['n0', 'n1']);
+  assert.equal(before.currentNow, 'n0');
+  const refresh = await monitor.poolCycle();
+  const after = monitor.getSnapshot();
+  assert.equal(refresh.skipped, true);
+  assert.deepEqual(after.members, before.members);
+  assert.equal(after.currentNow, before.currentNow);
+  assert.equal(after.diagnostics.candidateSnapshot.topologyFingerprint, before.diagnostics.candidateSnapshot.topologyFingerprint);
+});
+
+test('后台扫描批次异常时恢复未发布拓扑状态', async () => {
+  let cycle = 0;
+  const oldProxies = selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
+  const newProxies = selectorProxy('n1', ['n1', 'n2'], leafTypes(['n1', 'n2']));
+  const brokenResult = { ok: true };
+  Object.defineProperty(brokenResult, 'delay', {
+    get() { throw new Error('unexpected probe failure'); },
+  });
+  const api = makeApi({
+    getProxies: async () => ({ proxies: cycle++ === 0 ? oldProxies : newProxies }),
+    probe: async () => cycle === 1 ? { ok: true, delay: 10 } : brokenResult,
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, poolConcurrency: 1 },
+    clock: makeClock(),
+    logger: makeLogger(),
+  });
+  await monitor.poolCycle();
+  const before = monitor.getSnapshot();
+  await assert.rejects(() => monitor.poolCycle(), /unexpected probe failure/);
+  const after = monitor.getSnapshot();
+  assert.deepEqual(after.members, before.members);
+  assert.deepEqual(after.memberTypes, before.memberTypes);
+  assert.equal(after.currentNow, before.currentNow);
+  assert.equal(after.diagnostics.candidateSnapshot.topologyFingerprint, before.diagnostics.candidateSnapshot.topologyFingerprint);
+  assert.equal(after.poolInProgress, false);
+  assert.equal(after.diagnostics.scheduler.backgroundInProgress, false);
+});
+
+test('后台扫描读取或探测异常后释放轮次占用', async () => {
+  let calls = 0;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1'])) }),
+    probe: async () => {
+      calls += 1;
+      throw new Error('temporary probe failure');
+    },
+  });
+  const monitor = createMonitor({ api, config: { ...fastConfig, backgroundBatchSize: 1 }, clock: makeClock(), logger: makeLogger() });
+  await monitor.poolCycle();
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.backgroundInProgress, false);
+  assert.equal(calls > 0, true);
 });
 
 test('stop 时进行中的 poolCycle 不抛 null 异常', async () => {
@@ -842,6 +1290,41 @@ test('候选池为空时兜底切换到 URLTest 组', async () => {
   // 候选池空 + 当前节点失败达阈值 → 兜底切到 URLTest 组
   assert.deepEqual(selected, ['🎈 自动选择']);
   assert.equal(monitor.getSnapshot().currentNow, '🎈 自动选择');
+});
+
+test('切入 URLTest 后其内部叶子故障不重复触发 URLTest fallback', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(
+    currentNow,
+    ['🎈 自动选择', 'n0', 'n1'],
+    {
+      '🎈 自动选择': { type: 'URLTest', now: 'inner-1', all: ['inner-1'] },
+      n0: { type: 'Shadowsocks' },
+      n1: { type: 'Shadowsocks' },
+      'inner-1': { type: 'Shadowsocks' },
+    },
+  );
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async () => ({ ok: false, reason: 'timeout' }),
+    select: async (_group, node) => {
+      selected.push(node);
+      currentNow = node === '🎈 自动选择' ? 'inner-1' : node;
+      return { ok: true };
+    },
+  });
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  for (let i = 0; i < 6; i += 1) {
+    await monitor.watchCycle();
+    clock.advance(1000);
+  }
+
+  assert.deepEqual(selected, ['🎈 自动选择']);
+  assert.equal(monitor.getSnapshot().currentNow, 'inner-1');
+  assert.equal(monitor.getSnapshot().lastError, 'no-available-node');
 });
 
 test('方案 B：候选复核不可达不持久消耗候选池', async () => {
@@ -1187,6 +1670,33 @@ test('真实延迟探测：真实 GET 全部失败触发切换（sing-box 探测
   assert.equal(monitor.getSnapshot().currentNow, 'n1');
 });
 
+test('真实延迟探测：默认至少两个 URL 成功才算通过', async () => {
+  let currentNow = 'n0';
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1'])) }),
+    probe: async () => ({ ok: true, delay: 10 }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+  const httpGetImpl = async (url) => {
+    if (currentNow !== 'n0') return { body: 'ok' };
+    if (!url.includes('gstatic')) throw new Error('probe target unavailable');
+    return { body: 'ok' };
+  };
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, realProbeEnabled: true, realProbeUrls: ['https://github', 'https://google', 'https://gstatic'], realProbeMinSuccesses: 2, realDelayMs: 100 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl,
+  });
+  await monitor.poolCycle();
+  await monitor.watchCycle();
+  await monitor.runRealProbe();
+  assert.equal(monitor.getSnapshot().channelA.realSlowCount, 1, '一个 URL 成功不足门槛时应视为失败');
+  assert.deepEqual(selected, []);
+});
+
 test('真实延迟探测：多 URL 取最慢延迟，快 URL 不掩盖慢 URL', async () => {
   // 真实探测多个 URL 取最慢，避免「快 URL 掩盖慢 URL」漏判
   let currentNow = 'n0';
@@ -1404,8 +1914,78 @@ test('候选复核并行：排序后第一个候选不可达，跳过切第二�
   assert.equal(monitor.getSnapshot().currentNow, 'n2');
 });
 
-test('真实延迟探测：多 URL 并行（Promise.all）同时发起请求', async () => {
-  // realProbeAny 并行化后，多个 URL 应同时发起真实 GET，而非串行逐个
+test('真实探测长期不返回时按配置超时释放前台额度', async () => {
+  const proxies = selectorProxy('n0', ['n0'], leafTypes(['n0']));
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async () => ({ ok: true, delay: 1 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://hang.test'],
+      realProbeTimeoutMs: 20,
+    },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => new Promise(() => {}),
+  });
+
+  await monitor.poolCycle();
+  const result = await Promise.race([
+    monitor.runRealProbe(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('真实探测未按超时退出')), 200)),
+  ]);
+  assert.equal(result.skipped, false);
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.foregroundInFlight, 0);
+  assert.equal(monitor.getSnapshot().channelA.realDelay, null);
+});
+
+test('真实探测首个 URL 超时但底层未结束时，不提前启动下一个 URL', async () => {
+  const proxies = selectorProxy('n0', ['n0'], leafTypes(['n0']));
+  const starts = [];
+  let firstSettledAt = 0;
+  let firstSettledResolve;
+  const firstSettled = new Promise((resolve) => { firstSettledResolve = resolve; });
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async () => ({ ok: true, delay: 1 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://first.test', 'https://second.test'],
+      realProbeMinSuccesses: 2,
+      realProbeTimeoutMs: 20,
+    },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async (url) => {
+      starts.push({ url, at: Date.now() });
+      if (url === 'https://first.test') {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        firstSettledAt = Date.now();
+        firstSettledResolve(firstSettledAt);
+      }
+      return { body: 'ok' };
+    },
+  });
+
+  await monitor.poolCycle();
+  const probe = monitor.runRealProbe();
+  await firstSettled;
+  await probe;
+  const second = starts.find((entry) => entry.url === 'https://second.test');
+  assert.ok(second, '第二个 URL 应被调度');
+  assert.ok(second.at >= firstSettledAt, `第二个 URL 不应早于第一个底层请求结束：${second.at} < ${firstSettledAt}`);
+});
+
+test('真实延迟探测：多个 URL 不并发占用 GFS 原生请求桥', async () => {
+  // GFS 的原生 HttpGet 桥在并发调用时可能长期占用前台槽位；真实探测必须串行访问 URL。
   let currentNow = 'n0';
   const proxies = () => selectorProxy(currentNow, ['n0'], leafTypes(['n0']));
 
@@ -1443,7 +2023,7 @@ test('真实延迟探测：多 URL 并行（Promise.all）同时发起请求', a
   await monitor.poolCycle();
   await monitor.runRealProbe();
 
-  assert.ok(maxConcurrent >= 2, `多 URL 应并行探测（峰值并发 ${maxConcurrent} >= 2）`);
+  assert.equal(maxConcurrent, 1, `GFS 原生请求桥不应并发探测（峰值并发 ${maxConcurrent}）`);
 });
 
 test('盯梢期真实探测用更短超时：中等慢节点在短超时下被判失败再切', async () => {
