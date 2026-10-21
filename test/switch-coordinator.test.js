@@ -253,3 +253,23 @@ test('外部 now 变化使事务失效，不继续提交切换成功', async () 
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'current node changed');
 });
+
+test('并发预探测筛出可用候选', async () => {
+  let inflight = 0;
+  let maxInflight = 0;
+  const options = baseOptions({
+    probeCandidate: async (tag) => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inflight -= 1;
+      return tag === 'bad-good' ? { ok: false } : { ok: true };
+    },
+  });
+  const coordinator = createSwitchCoordinator({ ...options, candidateStore: makeStore([candidate('bad-good', 1), candidate('good', 2)]) });
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.ok, true);
+  assert.equal(result.node, 'good');
+  assert.deepEqual(options.calls.map(({ tag }) => tag), ['good']);
+  assert.equal(maxInflight, 2);
+});

@@ -11,7 +11,7 @@ test('normalizeConfig({}) 返回规格中的 31 项默认配置', () => {
     'https://www.google.com/generate_204',
     'https://github.com',
   ]);
-  assert.equal(config.watchIntervalMs, 10000);
+  assert.equal(config.watchIntervalMs, 5000);
   assert.equal(config.watchTimeoutMs, 4000);
   assert.equal(config.maxDelayMs, 2000);
   assert.equal(config.poolRefreshIntervalMs, 180000);

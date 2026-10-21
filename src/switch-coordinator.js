@@ -88,7 +88,7 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
     }
     const candidates = selection.candidates
       .filter((candidate) => stableKey(candidate.tag) !== stableKey(before.now))
-      .slice(0, Number(config?.preSwitchMaxProbe) || selection.candidates.length);
+      .slice(0, Number(config?.preSwitchConcurrentProbe) || Number(config?.preSwitchMaxProbe) || selection.candidates.length);
     const candidateGeneration = snapshot?.generation ?? null;
     let recheckedCount = 0;
     let successfulCount = 0;
@@ -116,7 +116,26 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
     let allowedCurrent = before.now;
     let confirmationFailed = false;
     const failedCandidateKeys = new Set();
-    for (const candidate of candidates) {
+    // 并发预探测：同时 HEAD 复核所有候选，筛出「当下可用」的，避免串行逐个复核 ~15s。
+    const probeResults = await Promise.all(candidates.map(async (candidate) => {
+      if (typeof probeCandidate !== 'function') return { candidate, ok: true };
+      recheckedCount += 1;
+      try {
+        const probe = await probeCandidate(candidate.tag, request);
+        if (!probe?.ok) {
+          failedCount += 1;
+          failedCandidateKeys.add(stableKey(candidate.tag));
+          return { candidate, ok: false };
+        }
+        return { candidate, ok: true };
+      } catch {
+        failedCount += 1;
+        failedCandidateKeys.add(stableKey(candidate.tag));
+        return { candidate, ok: false };
+      }
+    }));
+    const readyCandidates = probeResults.filter((probe) => probe.ok).map((probe) => probe.candidate);
+    for (const candidate of readyCandidates) {
       const candidateKey = stableKey(candidate.tag);
       if (failedCandidateKeys.has(candidateKey)) continue;
       const observed = observeCurrent();
@@ -124,15 +143,6 @@ export function createSwitchCoordinator({ api, config, clock = Date, logger = {}
         return result(false, { reason: 'current node changed', requestId, switchId });
       }
       try {
-        if (typeof probeCandidate === 'function') {
-          recheckedCount += 1;
-          const probe = await probeCandidate(candidate.tag, request);
-          if (!probe?.ok) {
-            failedCount += 1;
-            failedCandidateKeys.add(candidateKey);
-            continue;
-          }
-        }
         // 唯一的 Selector PUT 调用点：切换后立即确认 now，再用真实 GET 验证目标。
         await selectNode(candidate.tag);
         const confirmed = await api.getProxies();

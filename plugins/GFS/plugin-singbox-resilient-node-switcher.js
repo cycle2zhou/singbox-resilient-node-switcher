@@ -34,6 +34,7 @@ const DEFAULT_CONFIG = Object.freeze({
   stalkProbeDelayMs: 2000,
   stalkSuccessThreshold: 2,
   preSwitchMaxProbe: 3,
+  preSwitchConcurrentProbe: 8,
   // 真实延迟探测：sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟
   // （实测低 3~6 倍），导致 maxDelayMs 慢判定失效。真实延迟探测走系统代理（fetch 默认走
   // 系统代理，指向 sing-box 混合入站）发起真实 GET 并读 body，测到的就是用户实际感知延迟。
@@ -124,6 +125,7 @@ const POSITIVE_INTEGER_KEYS = [
   'optimizeThreshold',
   'stalkSuccessThreshold',
   'preSwitchMaxProbe',
+  'preSwitchConcurrentProbe',
   'realSlowThreshold',
   'realProbeMinSuccesses',
   'realStalkSuccessThreshold',
@@ -1153,7 +1155,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     }
     const candidates = selection.candidates
       .filter((candidate) => stableKey(candidate.tag) !== stableKey(before.now))
-      .slice(0, Number(config?.preSwitchMaxProbe) || selection.candidates.length);
+      .slice(0, Number(config?.preSwitchConcurrentProbe) || Number(config?.preSwitchMaxProbe) || selection.candidates.length);
     const candidateGeneration = snapshot?.generation ?? null;
     let recheckedCount = 0;
     let successfulCount = 0;
@@ -1181,7 +1183,26 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     let allowedCurrent = before.now;
     let confirmationFailed = false;
     const failedCandidateKeys = new Set();
-    for (const candidate of candidates) {
+    // 并发预探测：同时 HEAD 复核所有候选，筛出「当下可用」的，避免串行逐个复核 ~15s。
+    const probeResults = await Promise.all(candidates.map(async (candidate) => {
+      if (typeof probeCandidate !== 'function') return { candidate, ok: true };
+      recheckedCount += 1;
+      try {
+        const probe = await probeCandidate(candidate.tag, request);
+        if (!probe?.ok) {
+          failedCount += 1;
+          failedCandidateKeys.add(stableKey(candidate.tag));
+          return { candidate, ok: false };
+        }
+        return { candidate, ok: true };
+      } catch {
+        failedCount += 1;
+        failedCandidateKeys.add(stableKey(candidate.tag));
+        return { candidate, ok: false };
+      }
+    }));
+    const readyCandidates = probeResults.filter((probe) => probe.ok).map((probe) => probe.candidate);
+    for (const candidate of readyCandidates) {
       const candidateKey = stableKey(candidate.tag);
       if (failedCandidateKeys.has(candidateKey)) continue;
       const observed = observeCurrent();
@@ -1189,15 +1210,6 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
         return result(false, { reason: 'current node changed', requestId, switchId });
       }
       try {
-        if (typeof probeCandidate === 'function') {
-          recheckedCount += 1;
-          const probe = await probeCandidate(candidate.tag, request);
-          if (!probe?.ok) {
-            failedCount += 1;
-            failedCandidateKeys.add(candidateKey);
-            continue;
-          }
-        }
         // 唯一的 Selector PUT 调用点：切换后立即确认 now，再用真实 GET 验证目标。
         await selectNode(candidate.tag);
         const confirmed = await api.getProxies();
@@ -1911,7 +1923,7 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     candidateStore,
     observeCurrent: () => ({ now: currentNow }),
     probeCandidate: async (tag, request = {}) => {
-      const check = await probeAny(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
+      const check = await probeAnyWithTimeout(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
       return check;
     },
     realProbe: async (_tag, options = {}) => {

@@ -412,7 +412,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     candidateStore,
     observeCurrent: () => ({ now: currentNow }),
     probeCandidate: async (tag, request = {}) => {
-      const check = await probeAny(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
+      const check = await probeAnyWithTimeout(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
       return check;
     },
     realProbe: async (_tag, options = {}) => {

@@ -5,7 +5,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     'https://www.google.com/generate_204',
     'https://github.com',
   ]),
-  watchIntervalMs: 10000,
+  watchIntervalMs: 5000,
   watchTimeoutMs: 4000,
   maxDelayMs: 2000,
   poolRefreshIntervalMs: 180000,
@@ -26,6 +26,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   stalkProbeDelayMs: 2000,
   stalkSuccessThreshold: 2,
   preSwitchMaxProbe: 3,
+  preSwitchConcurrentProbe: 8,
   // 真实延迟探测：sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟
   // （实测低 3~6 倍），导致 maxDelayMs 慢判定失效。真实延迟探测走系统代理（fetch 默认走
   // 系统代理，指向 sing-box 混合入站）发起真实 GET 并读 body，测到的就是用户实际感知延迟。
@@ -116,6 +117,7 @@ const POSITIVE_INTEGER_KEYS = [
   'optimizeThreshold',
   'stalkSuccessThreshold',
   'preSwitchMaxProbe',
+  'preSwitchConcurrentProbe',
   'realSlowThreshold',
   'realProbeMinSuccesses',
   'realStalkSuccessThreshold',
