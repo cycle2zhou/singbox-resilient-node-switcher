@@ -79,3 +79,11 @@ test('扫描策略快照恢复后可撤销全池异常造成的扣分', () => {
   policy.restore(snapshot);
   assert.deepEqual(policy.getState('n1'), before);
 });
+
+test('快扫模式返回全量 tags（不切片）', () => {
+  const policy = createScanPolicy({ config: { ...DEFAULT_CONFIG, scanMainPoolSize: 20, scanExplorePoolSize: 5 }, clock: { now: () => 0 } });
+  const tags = Array.from({ length: 30 }, (_, index) => `n${index}`);
+  const targets = policy.selectTargets({ tags, currentNow: null, candidateTags: [], now: 0, fastScan: true });
+  assert.equal(targets.length, 30);
+  assert.equal(new Set(targets).size, 30);
+});

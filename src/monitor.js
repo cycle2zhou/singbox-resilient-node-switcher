@@ -50,6 +50,16 @@ function stableKey(tag) {
   return m ? m[1].trim() : tag;
 }
 
+// 节点死亡判定：只匹配 503（TCP 连接失败 = 明确的节点死亡）。
+// 504（sing-box 探测超时）/timeout（fetch 超时）不在此列——它们既可能是节点慢（偶发抖动，
+// 实测日本01 间歇 504：第一次 504、第二次 200ms），也可能是探测 URL 被墙的全局故障，
+// 必须保留累积/熔断保护，避免把抖动误判为断网、或把健康节点误标记为失败。
+// watchCycle 断网即时判定与 poolCycle 全池熔断共用此判定，语义统一。
+function isNodeDeath(reason) {
+  const t = String(reason || '').toLowerCase();
+  return t.includes('503');
+}
+
 export function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
   const cfg = normalizeConfig(config);
   const time = clock && typeof clock.now === 'function' ? clock : Date;
@@ -540,7 +550,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     const reason = result?.reason || 'probe failed';
     nodeStates.set(tag, recordProbeFailure(nodeStates.get(tag), now, reason, cfg));
     scanPolicy.recordProbe({ tag, ok: false, reason, now });
-    return { tag, probed: true, ok: false };
+    return { tag, probed: true, ok: false, reason };
   }
 
   async function poolCycle() {
@@ -643,11 +653,15 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       currentNow = selector.now;
 
       // 探测目标：评分策略控制后台预算；当前节点和候选始终强制保留，URLTest 不参与叶子探测。
+      // 冷启动快扫：首次成功发布候选快照前（candidateGeneration===0）全量探测建立 score 画像，
+      // 避免重启后死节点按成员顺序堵住好节点、候选池十几分钟为空。
+      const fastScan = candidateGeneration === 0;
       const policyTargets = scanPolicy.selectTargets({
         tags: members.filter((tag) => memberTypes[tag] !== 'URLTest'),
         currentNow,
         candidateTags: candidates,
         now: time.now(),
+        fastScan,
       });
       const probeTargets = policyTargets.filter((tag) => tag !== currentNow && memberTypes[tag] !== 'URLTest');
       lastScanTargetCount = probeTargets.length;
@@ -665,7 +679,9 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       schedulerState = targetState.state;
       const urls = probeUrlSequence(poolCycleCount);
       const results = [];
-      const batchSize = Math.min(schedulerState.backgroundBatchSize, schedulerState.backgroundConcurrency);
+      const batchSize = fastScan
+        ? Math.min(cfg.poolConcurrency, probeTargets.length)
+        : Math.min(schedulerState.backgroundBatchSize, schedulerState.backgroundConcurrency);
       for (let i = schedulerState.backgroundCursor; i < probeTargets.length; i += batchSize) {
         const batchStartedAt = time.now();
         let foregroundWaitMs = 0;
@@ -737,12 +753,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         topologyFingerprint: topology.topologyFingerprint,
       }).state;
 
-      // 全池失败熔断：实际探测节点失败率超过阈值则本轮作废
+      // 全池失败熔断：只对「非节点死亡」的失败熔断（isNodeDeath 见模块级定义，
+      // 503=节点死亡正常淘汰；504/timeout 可能是探测 URL 被墙的全局故障，必须保留熔断保护）。
       const probed = results.filter((r) => r.probed);
       if (probed.length > 0) {
-        const failures = probed.filter((r) => !r.ok).length;
-        const failureRate = failures / probed.length;
-        if (failureRate > cfg.poolFailureRateThreshold) {
+        const infraFailures = probed.filter((r) => !r.ok && !isNodeDeath(r.reason)).length;
+        const infraFailureRate = infraFailures / probed.length;
+        if (infraFailureRate > cfg.poolFailureRateThreshold) {
           restorePoolSnapshot();
           schedulerState = finishBackgroundBatch(schedulerState, {
             now: time.now(),
@@ -950,7 +967,11 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
           watchOptimizeCount = 0;
         }
       } else {
-        watchFailureCount += 1;
+        // 明确断网（503 连接失败）一次即判，无需累积 failureThreshold 次；
+        // 软失败（504 超时/timeout/延迟高/退化）仍走多次确认，避免把偶发抖动误判为断网。
+        watchFailureCount = isNodeDeath(result?.reason)
+          ? (stalking ? 1 : cfg.failureThreshold)
+          : watchFailureCount + 1;
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;

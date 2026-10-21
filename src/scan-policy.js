@@ -75,9 +75,12 @@ export function createScanPolicy({ config, clock = Date } = {}) {
     for (const [tag, state] of snapshotState.states) states.set(tag, { ...state });
   }
 
-  function selectTargets({ tags = [], currentNow = null, candidateTags = [], now = time.now() } = {}) {
+  function selectTargets({ tags = [], currentNow = null, candidateTags = [], now = time.now(), fastScan = false } = {}) {
     round += 1;
     const uniqueTags = [...new Set(tags)];
+    if (fastScan) {
+      return uniqueTags;
+    }
     const forced = [];
     const addForced = (tag) => {
       if (tag && uniqueTags.includes(tag) && !forced.includes(tag)) forced.push(tag);

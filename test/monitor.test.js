@@ -83,6 +83,24 @@ test('通道 B 同步成员、跳过 URLTest 与当前 now、按成员顺序产�
   assert.deepEqual(snap.candidates, ['node-b']);
 });
 
+test('冷启动 poolCycle 全量快扫（candidateGeneration=0 时探测全部非当前节点）', async () => {
+  const tags = Array.from({ length: 30 }, (_, i) => `n${i}`);
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+  const probed = new Set();
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async (node) => {
+      probed.add(node);
+      return { ok: true, delay: 1 };
+    },
+  });
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle();
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.diagnostics.scan.targetCount, 29);
+  assert.equal(probed.size, 29);
+});
+
 test('通道 B 并发峰值不超过 poolConcurrency 且跳过当前 now', async () => {
   const tags = Array.from({ length: 9 }, (_, i) => `n${i}`);
   const proxies = selectorProxy('n0', tags, leafTypes(tags));
@@ -160,6 +178,34 @@ test('通道 A 只探当前 now，连续失败达到 failureThreshold 后从 can
   assert.equal(snap.lastSwitch.candidateGeneration, 1);
   assert.equal(snap.lastSwitch.candidateDelay, 10);
   assert.equal(snap.lastSwitch.candidateRecheck, true);
+});
+
+test('当前节点 503 连接失败一次即触发切换（不累积 failureThreshold 次）', async () => {
+  let currentNow = 'n0';
+  const proxies = () => selectorProxy(currentNow, ['n0', 'n1'], leafTypes(['n0', 'n1']));
+
+  const selected = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => (node === 'n1' ? { ok: true, delay: 10 } : { ok: false, reason: 'request failed with HTTP 503' }),
+    select: async (_group, node) => { selected.push(node); currentNow = node; return { ok: true }; },
+  });
+
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  await monitor.poolCycle();
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1']);
+
+  // 第一次 watchCycle：n0 探测 503 → 硬断网即时判定（watchFailureCount 直接到阈值），被 minDwellMs 挡住
+  await monitor.watchCycle();
+  clock.advance(1000);
+  // 第二次 watchCycle：dwell 满足，立即切换（无需累积 3 次）
+  await monitor.watchCycle();
+
+  assert.deepEqual(selected, ['n1']);
+  assert.equal(monitor.getSnapshot().currentNow, 'n1');
+  assert.equal(monitor.getSnapshot().lastSwitch.reason, 'failure');
 });
 
 test('通道 A 延迟劣化：基线满后实时延迟>中位数×ratio 连续 2 次触发切换', async () => {
