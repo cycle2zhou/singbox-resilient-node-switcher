@@ -32,7 +32,7 @@ test('normalizeConfig({}) 返回规格中的 31 项默认配置', () => {
   assert.equal(config.stalkProbeDelayMs, 2000);
   assert.equal(config.stalkSuccessThreshold, 2);
   assert.equal(config.preSwitchMaxProbe, 3);
-  assert.equal(config.realProbeEnabled, true);
+  assert.equal(config.realProbeEnabled, false);
   assert.deepEqual(config.realProbeUrls, [
     'https://github.com',
     'https://www.google.com',
@@ -294,10 +294,10 @@ test('稳定性择优返回完整默认配置并安全归一化', () => {
 });
 
 test('realProbeEnabled 只接受布尔值', () => {
-  assert.equal(normalizeConfig({}).realProbeEnabled, true);
+  assert.equal(normalizeConfig({}).realProbeEnabled, false);
   assert.equal(normalizeConfig({ realProbeEnabled: false }).realProbeEnabled, false);
   assert.equal(normalizeConfig({ realProbeEnabled: true }).realProbeEnabled, true);
   for (const value of [0, 1, 'true', null, undefined, {}]) {
-    assert.equal(normalizeConfig({ realProbeEnabled: value }).realProbeEnabled, true, `realProbeEnabled 应回退默认 ${String(value)}`);
+    assert.equal(normalizeConfig({ realProbeEnabled: value }).realProbeEnabled, false, `realProbeEnabled 应回退默认 ${String(value)}`);
   }
 });

@@ -87,3 +87,28 @@ test('快扫模式返回全量 tags（不切片）', () => {
   assert.equal(targets.length, 30);
   assert.equal(new Set(targets).size, 30);
 });
+
+test('快扫反转顺序（先探测列表末尾，机场专线通常在末尾）', () => {
+  const policy = createScanPolicy({ config: DEFAULT_CONFIG, clock: { now: () => 0 } });
+  const tags = ['n0', 'n1', 'n2', 'n3', 'n4'];
+  const targets = policy.selectTargets({ tags, currentNow: null, candidateTags: [], now: 0, fastScan: true });
+  assert.deepEqual(targets, ['n4', 'n3', 'n2', 'n1', 'n0']);
+});
+
+test('连续失败 3 次后指数退避（死节点降低探测频率），成功探测重置', () => {
+  const policy = createScanPolicy({ config: DEFAULT_CONFIG, clock: { now: () => 0 } });
+  policy.recordProbe({ tag: 'n1', ok: false, reason: 'request timeout', now: 0 });
+  assert.equal(policy.getState('n1').nextProbeAt, 6 * 10000);
+  policy.recordProbe({ tag: 'n1', ok: false, reason: 'request timeout', now: 60000 });
+  assert.equal(policy.getState('n1').nextProbeAt, 60000 + 6 * 10000);
+  policy.recordProbe({ tag: 'n1', ok: false, reason: 'request timeout', now: 120000 });
+  assert.equal(policy.getState('n1').nextProbeAt, 120000 + 12 * 10000);
+  policy.recordProbe({ tag: 'n1', ok: false, reason: 'request timeout', now: 240000 });
+  assert.equal(policy.getState('n1').nextProbeAt, 240000 + 24 * 10000);
+  policy.recordProbe({ tag: 'n1', ok: false, reason: 'request timeout', now: 480000 });
+  assert.equal(policy.getState('n1').nextProbeAt, 480000 + 48 * 10000);
+  policy.recordProbe({ tag: 'n1', ok: false, reason: 'request timeout', now: 960000 });
+  assert.equal(policy.getState('n1').nextProbeAt, 960000 + 64 * 10000);
+  policy.recordProbe({ tag: 'n1', ok: true, delay: 100, now: 1600000 });
+  assert.equal(policy.getState('n1').consecutiveFailures, 0);
+});

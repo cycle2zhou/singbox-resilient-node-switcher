@@ -75,11 +75,8 @@ test('通道 B 同步成员、跳过 URLTest 与当前 now、按成员顺序产�
   assert.deepEqual([...snap.members].sort(), ['node-a', 'node-b', '🎈 自动选择']);
   assert.equal(snap.memberTypes['🎈 自动选择'], 'URLTest');
   assert.equal(snap.memberTypes['inner-1'], undefined);
-  // 只探测 node-b（跳过当前 now node-a 与 URLTest）；并行短路下 node-b 同时探测全部 URL
-  assert.ok(
-    probed.length === DEFAULT_CONFIG.probeUrls.length && probed.every((n) => n === 'node-b'),
-    `只探测 node-b（并行探测全部 ${DEFAULT_CONFIG.probeUrls.length} 个 URL）`,
-  );
+  // 只探测 node-b（跳过当前 now node-a 与 URLTest）；冷启动快扫单 URL 探测
+  assert.deepEqual(probed, ['node-b']);
   assert.deepEqual(snap.candidates, ['node-b']);
 });
 
@@ -99,6 +96,26 @@ test('冷启动 poolCycle 全量快扫（candidateGeneration=0 时探测全部�
   const snap = monitor.getSnapshot();
   assert.equal(snap.diagnostics.scan.targetCount, 29);
   assert.equal(probed.size, 29);
+});
+
+test('冷启动快扫用更短超时（coldStartTimeoutMs）快速分辨死活', async () => {
+  const tags = Array.from({ length: 5 }, (_, i) => `n${i}`);
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+  const timeouts = [];
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async (_node, _url, timeoutMs) => {
+      timeouts.push(timeoutMs);
+      return { ok: true, delay: 1 };
+    },
+  });
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle(); // 冷启动快扫
+  assert.ok(timeouts.length > 0, '快扫应发起探测');
+  assert.ok(
+    timeouts.every((t) => t === DEFAULT_CONFIG.coldStartTimeoutMs),
+    `快扫探测超时应统一为 coldStartTimeoutMs ${DEFAULT_CONFIG.coldStartTimeoutMs}，而非 poolTimeoutMs`,
+  );
 });
 
 test('通道 B 并发峰值不超过 poolConcurrency 且跳过当前 now', async () => {
@@ -123,12 +140,12 @@ test('通道 B 并发峰值不超过 poolConcurrency 且跳过当前 now', async
   const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
   await monitor.poolCycle();
 
-  // 并行短路下每个节点同时探测全部 URL，故并发上界与探测次数都乘以 URL 数
+  // 冷启动快扫单 URL 探测：并发上界与探测次数都等于节点数（不再乘以 URL 数）
   assert.ok(
-    maxActive <= fastConfig.poolConcurrency * DEFAULT_CONFIG.probeUrls.length,
-    `并发峰值 ${maxActive} 应不超过 poolConcurrency×URL数 ${fastConfig.poolConcurrency * DEFAULT_CONFIG.probeUrls.length}`,
+    maxActive <= fastConfig.poolConcurrency,
+    `并发峰值 ${maxActive} 应不超过 poolConcurrency ${fastConfig.poolConcurrency}`,
   );
-  assert.equal(probeCount, (tags.length - 1) * DEFAULT_CONFIG.probeUrls.length);
+  assert.equal(probeCount, tags.length - 1);
 });
 
 test('主 Selector 缺失、类型非 Selector 或空成员时停止并报告原因', async () => {
@@ -334,6 +351,49 @@ test('通道 B 全池失败率超过阈值时本轮作废、不推进状态', as
   assert.match(snap2.lastError, /熔断|全池|失败率/);
 });
 
+test('节点真实死亡(503)不触发熔断：混合 503/504 失败仍正常记录健康节点', async () => {
+  const tags = ['n0', 'n1', 'n2', 'n3'];
+  const proxies = () => selectorProxy('n0', tags, leafTypes(tags));
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (node === 'n1') return { ok: true, delay: 10 };
+      if (node === 'n2') return { ok: false, reason: 'request failed with HTTP 503' };
+      return { ok: false, reason: 'request failed with HTTP 504' };
+    },
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle(); // 冷启动快扫
+
+  const snap = monitor.getSnapshot();
+  // 有 503 硬死亡说明节点真实死亡而非探测 URL 被墙，应正常记录淘汰，健康节点进候选池
+  assert.ok(snap.candidates.includes('n1'), '健康节点应进候选池');
+  assert.ok(!/熔断|全池|失败率/.test(snap.lastError || ''), '有 503 硬死亡不应触发熔断');
+});
+
+test('大量节点 504 超时但仍有健康节点成功时不熔断（冷启动快扫场景）', async () => {
+  const tags = Array.from({ length: 20 }, (_, i) => `n${i}`);
+  const proxies = () => selectorProxy('n0', tags, leafTypes(tags));
+
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    // n1 健康，其余 18 个全 504（模拟 CF-自建死节点超时被短超时误判为全局故障）
+    probe: async (node) => {
+      if (node === 'n1') return { ok: true, delay: 10 };
+      return { ok: false, reason: 'request failed with HTTP 504' };
+    },
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle(); // 冷启动快扫
+
+  const snap = monitor.getSnapshot();
+  assert.ok(snap.candidates.includes('n1'), '唯一健康节点应进候选池');
+  assert.ok(!/熔断|全池|失败率/.test(snap.lastError || ''), '有健康节点探测成功即说明探测目标可达，不应熔断');
+});
+
 test('通道 A 并行短路多 URL：一轮同时探测全部 URL，任一成功即返回', async () => {
   const proxies = () => selectorProxy('n0', ['n0', 'n1'], leafTypes(['n0', 'n1']));
 
@@ -374,6 +434,27 @@ test('通道 B 短路多 URL：对 gstatic/google 不可达但 github 可达的�
   assert.ok(snap.candidates.includes('n1'), '对 gstatic/google 不可达但 github 可达的节点应进入候选池');
   assert.equal(snap.nodeStates['n1'].status, 'healthy');
   assert.equal(snap.nodeStates['n1'].lastDelay, 20);
+});
+
+test('冷启动快扫只探测 1 个 URL（最稳定的最后一项）以提速，避免 3 URL 耗尽低并发连接池', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  const proxies = () => selectorProxy('n0', tags, leafTypes(tags));
+
+  const probedUrls = new Set();
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (_node, url) => {
+      probedUrls.add(url);
+      return { ok: true, delay: 10 };
+    },
+  });
+
+  const monitor = createMonitor({ api, config: fastConfig, clock: makeClock(0), logger: makeLogger() });
+  await monitor.poolCycle(); // 冷启动快扫
+
+  // 快扫只用 probeUrls 最后一项（github，最稳定），而不是 3 URL 并行
+  const expected = DEFAULT_CONFIG.probeUrls[DEFAULT_CONFIG.probeUrls.length - 1];
+  assert.deepEqual([...probedUrls], [expected]);
 });
 
 test('切换后驻留期 minDwellMs 内不二次切换', async () => {
@@ -1989,6 +2070,71 @@ test('真实探测长期不返回时按配置超时释放前台额度', async ()
   assert.equal(monitor.getSnapshot().channelA.realDelay, null);
 });
 
+test('真实探测多 URL 首个挂起时不死等底层请求（serializeNative 软超时）', async () => {
+  // 修复：realProbeAny 的 serializeNative 模式在「等前一个 native 请求结束」时加软超时，
+  // 否则当前节点不可用时 native HttpGet 永久挂起，line 271 await nativeHttpGetTail 死等，
+  // runRealProbe 卡住、foregroundInFlight 泄漏、后台快扫被 foreground-wait 阻塞。
+  const proxies = selectorProxy('n0', ['n0'], leafTypes(['n0']));
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async () => ({ ok: true, delay: 1 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://hang1.test', 'https://hang2.test'],
+      realProbeTimeoutMs: 20,
+    },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => new Promise(() => {}),
+  });
+
+  await monitor.poolCycle();
+  const result = await Promise.race([
+    monitor.runRealProbe(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('多 URL 挂起未按超时退出')), 200)),
+  ]);
+  assert.equal(result.skipped, false);
+  assert.equal(monitor.getSnapshot().diagnostics.scheduler.foregroundInFlight, 0);
+});
+
+test('冷启动快扫不被前台真实探测占用 foreground 预算而阻塞', async () => {
+  // 修复：快扫（fastScan）是建立候选池的关键路径，跳过 foreground-wait，避免被
+  // 前台探测（runRealProbe/watchCycle）占用 foreground 预算而无限等待。
+  const tags = ['n0', 'n1', 'n2', 'n3'];
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async () => ({ ok: true, delay: 1 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: {
+      ...fastConfig,
+      realProbeEnabled: true,
+      realProbeUrls: ['https://hang.test'],
+      realProbeTimeoutMs: 500,
+    },
+    clock: makeClock(0),
+    logger: makeLogger(),
+    httpGetImpl: async () => new Promise(() => {}),
+  });
+
+  await monitor.watchCycle();
+  const realProbePromise = monitor.runRealProbe();
+
+  await Promise.race([
+    monitor.poolCycle(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('快扫被 foreground 阻塞')), 200)),
+  ]);
+
+  assert.ok(monitor.getSnapshot().diagnostics.candidateSnapshot.generation > 0);
+  await realProbePromise.catch(() => {});
+});
+
 test('真实探测首个 URL 超时但底层未结束时，不提前启动下一个 URL', async () => {
   const proxies = selectorProxy('n0', ['n0'], leafTypes(['n0']));
   const starts = [];
@@ -2141,4 +2287,74 @@ test('盯梢期真实探测用更短超时：中等慢节点在短超时下被�
 
   assert.deepEqual(selected, ['n1', 'n2'], '盯梢期短超时下 n1 60ms 超时失效应触发再切 n2');
   assert.equal(monitor.getSnapshot().currentNow, 'n2');
+});
+
+test('冷启动快扫用 coldStartConcurrency 控制并发（低于 WebView 连接池上限避免排队挂起）', async () => {
+  const tags = Array.from({ length: 15 }, (_, i) => `n${i}`);
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+  let inflight = 0;
+  let maxInflight = 0;
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async () => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      await new Promise((r) => setTimeout(r, 5));
+      inflight -= 1;
+      return { ok: true, delay: 1 };
+    },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, coldStartConcurrency: 5 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+  });
+  await monitor.poolCycle();
+  assert.ok(maxInflight <= 5, `快扫并发峰值 ${maxInflight} 应不超过 coldStartConcurrency 5`);
+});
+
+test('快扫探测挂起时通过软超时继续（不死等挂起的 fetch）', async () => {
+  const tags = ['n0', 'n1', 'n2', 'n3'];
+  const proxies = selectorProxy('n0', tags, leafTypes(tags));
+  const api = makeApi({
+    getProxies: async () => ({ proxies }),
+    probe: async (node) => (node === 'n2' ? new Promise(() => {}) : { ok: true, delay: 1 }),
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, coldStartTimeoutMs: 20 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+  });
+  await Promise.race([
+    monitor.poolCycle(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('快扫被挂起的 fetch 卡住')), 500)),
+  ]);
+  assert.ok(monitor.getSnapshot().diagnostics.candidateSnapshot.generation > 0, 'n2 挂起被软超时放弃，n1/n3 成功建立候选池');
+});
+
+test('冷启动快扫超时时发布部分候选池（渐进建立），打破超时回滚死循环', async () => {
+  const tags = ['n0', 'n1', 'n2', 'n3', 'n4'];
+  let currentNow = 'n0';
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, tags, leafTypes(tags)) }),
+    // n4 快速成功（快扫反转后第一批探测到）；其余节点慢（200ms）触发超时中断
+    probe: async (node) => {
+      if (node === 'n4') return { ok: true, delay: 10 };
+      return new Promise((resolve) => setTimeout(() => resolve({ ok: false, reason: 'timeout' }), 200));
+    },
+    select: async (_group, tag) => { currentNow = tag; return { ok: true }; },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, coldStartConcurrency: 2, backgroundRoundDeadlineMs: 100 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+  });
+  await monitor.poolCycle(); // 冷启动快扫，deadline 100ms 超时中断
+  const snapshot = monitor.getSnapshot();
+  // 快扫超时但部分发布：n4 成功进候选池，generation 递增，下一轮进入正常轮次（不死循环）
+  assert.ok(snapshot.diagnostics.candidateSnapshot.generation > 0, JSON.stringify(snapshot.diagnostics.candidateSnapshot));
+  assert.deepEqual(snapshot.candidates, ['n4'], JSON.stringify(snapshot.candidates));
 });

@@ -233,10 +233,10 @@
     {
       "id": "ID_real_probe_enabled",
       "title": "真实延迟探测",
-      "description": "sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟（实测低 3~6 倍）。开启后用 fetch 走系统代理发起真实 GET 并读响应体，测到用户实际感知延迟，作为慢判定的可靠补充",
+      "description": "sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟（实测低 3~6 倍）。开启后走系统代理发起真实 GET 并读响应体，测到用户实际感知延迟。注意：GFS 插件访问外部域名在出口节点故障/超时时会挂起阻塞主线程、导致快扫卡死，默认关闭，仅在你确认出口稳定时手动开启",
       "key": "RealProbeEnabled",
       "component": "Switch",
-      "value": true,
+      "value": false,
       "options": []
     },
     {

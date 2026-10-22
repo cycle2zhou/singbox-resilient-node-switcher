@@ -10,6 +10,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   maxDelayMs: 2000,
   poolRefreshIntervalMs: 180000,
   poolTimeoutMs: 2000,
+  // 冷启动快扫探测超时：快扫只分辨死活（精确延迟交给后续正常轮次）。
+  // 实测（早上网络拥堵）健康节点（宝可梦 180ms）连接建立也需 >1s，1s 超时会把健康
+  // 节点误判 504 导致候选池空；3000ms 能正确区分好节点（成功）和死节点（504 超时）。
+  coldStartTimeoutMs: 3000,
+  // 冷启动快扫并发：WebView fetch 同 host 连接池并发有限（约 6），快扫并发过高会让
+  // 请求排队，偶发请求在排队中挂起（fetch 不响应 abort）导致快扫卡住。降到连接池上限
+  // 以下，187 节点全量快扫约 1 分钟完成且不排队。
+  coldStartConcurrency: 5,
   poolConcurrency: 20,
   poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
@@ -30,7 +38,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   // 真实延迟探测：sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟
   // （实测低 3~6 倍），导致 maxDelayMs 慢判定失效。真实延迟探测走系统代理（fetch 默认走
   // 系统代理，指向 sing-box 混合入站）发起真实 GET 并读 body，测到的就是用户实际感知延迟。
-  realProbeEnabled: true,
+  // 注意：GFS 插件运行在 webview，访问外部域名（走系统代理）的请求在出口节点故障/超时
+  // 时会同步桥接挂起并阻塞 JS 主线程，导致所有 setTimeout（探测软超时、持久化定时器）失效、
+  // 快扫整体卡死。因此默认关闭，改用本地 sing-box API 的 HEAD 探测（不访问外部域名、不挂起）。
+  realProbeEnabled: false,
   realProbeUrls: Object.freeze([
     'https://github.com',
     'https://www.google.com',
@@ -56,6 +67,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   scanScoreMediumThreshold: 80,
   scanScoreLowThreshold: 70,
   scanBackoffRounds: 6,
+  // 死节点指数退避上限（轮数）：连续失败 >= 3 次后退避指数增长，最终封顶到 64 轮
+  // （64 × scanIntervalMs=10s ≈ 10.7 分钟才复探一次），把死节点挤出正常轮次。
+  scanBackoffMaxRounds: 64,
   scanSuccessStep: 5,
   scanFailureStep: 15,
   scanHttp503Step: 10,
@@ -88,6 +102,7 @@ const POSITIVE_KEYS = [
   'maxDelayMs',
   'poolRefreshIntervalMs',
   'poolTimeoutMs',
+  'coldStartTimeoutMs',
   'initialCooldownMs',
   'minDwellMs',
   'degradationRatio',
@@ -108,6 +123,7 @@ const POSITIVE_KEYS = [
 ];
 
 const POSITIVE_INTEGER_KEYS = [
+  'coldStartConcurrency',
   'poolConcurrency',
   'failureThreshold',
   'recoveryThreshold',
@@ -134,6 +150,7 @@ const POSITIVE_INTEGER_KEYS = [
   'scanScoreMediumThreshold',
   'scanScoreLowThreshold',
   'scanBackoffRounds',
+  'scanBackoffMaxRounds',
   'scanSuccessStep',
   'scanFailureStep',
   'scanHttp503Step',
