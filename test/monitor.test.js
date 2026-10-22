@@ -2390,3 +2390,31 @@ test('正常轮次超时回滚拓扑但保留死节点失败计数（方案 D �
   assert.ok(n1State, 'n1 应有 scanPolicy 状态');
   assert.equal(n1State[1].consecutiveFailures, 1, '正常轮次死节点失败计数应保留（不回滚清零）');
 });
+
+test('候选池保留间歇性失败的 suspect 节点（不缩水）', async () => {
+  const tags = ['n0', 'n1', 'n2'];
+  const proxies = () => selectorProxy('n0', tags, leafTypes(tags));
+  let round = 0;
+  const api = makeApi({
+    getProxies: async () => ({ proxies: proxies() }),
+    probe: async (node) => {
+      if (round === 0) {
+        return node === 'n0' ? { ok: false, reason: 'timeout' } : { ok: true, delay: node === 'n1' ? 10 : 20 };
+      }
+      return node === 'n2' ? { ok: false, reason: 'request failed with HTTP 504' } : { ok: true, delay: 10 };
+    },
+  });
+  const clock = makeClock(0);
+  const monitor = createMonitor({ api, config: fastConfig, clock, logger: makeLogger() });
+
+  round = 0;
+  await monitor.poolCycle(); // 快扫：n1/n2 成功
+  assert.deepEqual(monitor.getSnapshot().candidates, ['n1', 'n2']);
+
+  round = 1;
+  clock.advance(10000);
+  await monitor.poolCycle(); // 正常轮次：n2 抖动失败
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.nodeStates['n2'].status, 'suspect');
+  assert.ok(snap.candidates.includes('n2'), 'suspect 节点（lastDelay 保留）应留在候选池');
+});

@@ -1112,12 +1112,16 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
   if (typeof observeCurrent !== 'function') throw new TypeError('observeCurrent is required');
   if (typeof realProbe !== 'function') throw new TypeError('realProbe is required');
   const time = clock && typeof clock.now === 'function' ? clock : Date;
+  // 等待态冷却时间：同一节点同一代候选池切换失败后，冷却期内不再重复尝试；
+  // 超过冷却期则重置等待态，允许重新尝试（免费节点间歇性抖动，候选可能已恢复）。
+  const WAITING_COOLDOWN_MS = 30000;
   let stopped = false;
   let serial = 0;
   let active = null;
   let pending = null;
   let waitingKey = null;
   let waitingGeneration = null;
+  let waitingSince = 0;
 
   function result(ok, fields = {}) { return { ok, ...fields }; }
 
@@ -1133,7 +1137,8 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     const priority = Number.isFinite(request?.priority) ? request.priority : (request?.reason === 'failure' ? 10 : 1);
     const snapshot = candidateStore.getSnapshot();
     const currentKey = stableKey(before.now);
-    if (waitingKey === currentKey && waitingGeneration === (snapshot?.generation ?? null)) {
+    if (waitingKey === currentKey && waitingGeneration === (snapshot?.generation ?? null)
+      && time.now() - waitingSince < WAITING_COOLDOWN_MS) {
       return result(false, { reason: 'no-available-node', requestId, switchId });
     }
     const allowExpired = request?.reason === 'failure' || priority >= 10;
@@ -1148,6 +1153,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
         if (stableKey(fallbackTag) === stableKey(before.now)) {
           waitingKey = currentKey;
           waitingGeneration = snapshot?.generation ?? null;
+          waitingSince = time.now();
           return result(false, { reason: 'no-available-node', requestId, switchId });
         }
         if (typeof fallbackTag === 'string') {
@@ -1157,6 +1163,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
           if (stableKey(now) === stableKey(fallbackTag)) {
             waitingKey = null;
             waitingGeneration = null;
+            waitingSince = 0;
             await onNowConfirmed?.(now);
             await onConfirmed?.({
               from: before.now,
@@ -1301,6 +1308,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
       if (stableKey(fallbackTag) === stableKey(before.now)) {
         waitingKey = currentKey;
         waitingGeneration = snapshot?.generation ?? null;
+        waitingSince = time.now();
         return result(false, { reason: 'no-available-node', requestId, switchId });
       }
       if (typeof fallbackTag === 'string') {
@@ -1311,6 +1319,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
           if (stableKey(now) === stableKey(fallbackTag)) {
             waitingKey = null;
             waitingGeneration = null;
+            waitingSince = 0;
             await onNowConfirmed?.(now);
             await onConfirmed?.({
               from: before.now,
@@ -2360,7 +2369,10 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
       candidates = probeTargets
         .filter((tag) => {
           const st = nodeStates.get(tag);
-          return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
+          // 放宽到「可恢复」（healthy 或 suspect）：免费节点间歇性抖动（约 75% 时间 504）时，
+          // 单次失败会进入 suspect，若仅保留 healthy 会导致候选池在正常轮次被频繁清空、缩水到 1 个。
+          // suspect 节点 lastDelay 仍保留（上次成功），切换前会经 probeCandidate 复核，安全。
+          return st && isEligibleCandidate(st) && st.lastDelay != null;
         })
         .sort((a, b) => {
           const diff = (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity);

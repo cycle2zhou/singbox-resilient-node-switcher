@@ -23,6 +23,7 @@ import {
   recordProbeSuccess,
   recordProbeFailure,
   markCooldown,
+  isEligibleCandidate,
 } from './health-state.js';
 
 function silentLogger() {
@@ -813,7 +814,10 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       candidates = probeTargets
         .filter((tag) => {
           const st = nodeStates.get(tag);
-          return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
+          // 放宽到「可恢复」（healthy 或 suspect）：免费节点间歇性抖动（约 75% 时间 504）时，
+          // 单次失败会进入 suspect，若仅保留 healthy 会导致候选池在正常轮次被频繁清空、缩水到 1 个。
+          // suspect 节点 lastDelay 仍保留（上次成功），切换前会经 probeCandidate 复核，安全。
+          return st && isEligibleCandidate(st) && st.lastDelay != null;
         })
         .sort((a, b) => {
           const diff = (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity);

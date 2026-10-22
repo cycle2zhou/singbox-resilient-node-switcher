@@ -273,3 +273,32 @@ test('并发预探测筛出可用候选', async () => {
   assert.deepEqual(options.calls.map(({ tag }) => tag), ['good']);
   assert.equal(maxInflight, 2);
 });
+
+test('等待态冷却时间后重新尝试切换（节点可能恢复）', async () => {
+  let now = 0;
+  let probeCalls = 0;
+  const options = baseOptions({
+    clock: { now: () => now },
+    probeCandidate: async () => { probeCalls += 1; return { ok: false, reason: 'unreachable' }; },
+    fallback: async () => 'urltest',
+  });
+  options.setCurrent('urltest');
+  const coordinator = createSwitchCoordinator({
+    ...options,
+    candidateStore: makeStore([candidate('dead'), candidate('dead2')]),
+  });
+  // 第一次：候选复核失败 → fallback 返回当前 → waitingKey + no-available-node
+  const result = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(result.reason, 'no-available-node');
+  assert.equal(probeCalls, 2);
+  // 冷却期内（10 秒）：waitingKey 匹配，直接 no-available-node，probeCandidate 不调用
+  now = 10000;
+  const repeated = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(repeated.reason, 'no-available-node');
+  assert.equal(probeCalls, 2);
+  // 冷却时间后（35 秒）：waitingKey 失效，重新尝试（probeCandidate 被调用）
+  now = 35000;
+  const retried = await coordinator.requestSwitch({ reason: 'failure', priority: 10 });
+  assert.equal(retried.reason, 'no-available-node');
+  assert.equal(probeCalls, 4);
+});
