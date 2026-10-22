@@ -593,11 +593,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     const snapshotCurrentNow = currentNow;
     const snapshotTopologyFingerprint = topologyFingerprint;
     const snapshotCurrentUrlTestGroup = currentUrlTestGroup;
-    const restorePoolSnapshot = () => {
+    const restorePoolSnapshot = (keepScanPolicy = false) => {
       nodeStates.clear();
       for (const [k, v] of snapshotStates) nodeStates.set(k, v);
       candidates = snapshotCandidates;
-      scanPolicy.restore(snapshotScanPolicy);
+      if (!keepScanPolicy) {
+        scanPolicy.restore(snapshotScanPolicy);
+      }
       members = snapshotMembers;
       memberTypes = snapshotMemberTypes;
       currentNow = snapshotCurrentNow;
@@ -707,12 +709,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         let foregroundWaitMs = 0;
         if (cycleController.signal.aborted) {
           if (fastScan) {
-            // 冷启动快扫超时：保留已探测结果，发布部分候选池（渐进建立），
-            // 打破「超时回滚→candidateGeneration 不增→反复快扫」死循环。
+            // 冷启动快扫超时：保留已探测结果，发布部分候选池（渐进建立）。
             break;
           }
+          // 正常轮次超时：回滚拓扑+节点状态（不泄漏半更新订阅），但保留 scanPolicy
+          // （死节点 consecutiveFailures 累积，方案 D 指数退避才能生效）。
           schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-          restorePoolSnapshot();
+          restorePoolSnapshot(true);
           return { skipped: true, error: null };
         }
         // 冷启动快扫是建立候选池的关键路径，不应被前台探测（watchCycle/runRealProbe）占用
@@ -733,7 +736,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
               timeoutReason: lastTimeoutReason,
             };
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           i -= batchSize;
@@ -771,8 +774,9 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
               // 冷启动快扫超时：发布部分候选池（渐进建立），不回滚已探测结果。
               break;
             }
+            // 正常轮次超时：回滚拓扑+节点状态（不泄漏），保留 scanPolicy（死节点失败计数累积）。
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           restorePoolSnapshot();

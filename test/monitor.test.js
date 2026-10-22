@@ -2358,3 +2358,35 @@ test('冷启动快扫超时时发布部分候选池（渐进建立），打破�
   assert.ok(snapshot.diagnostics.candidateSnapshot.generation > 0, JSON.stringify(snapshot.diagnostics.candidateSnapshot));
   assert.deepEqual(snapshot.candidates, ['n4'], JSON.stringify(snapshot.candidates));
 });
+
+test('正常轮次超时回滚拓扑但保留死节点失败计数（方案 D 可累积）', async () => {
+  const tags = ['n0', 'n1', 'n2', 'n3', 'n4'];
+  let currentNow = 'n0';
+  const api = makeApi({
+    getProxies: async () => ({ proxies: selectorProxy(currentNow, tags, leafTypes(tags)) }),
+    probe: async (node) => {
+      if (node === 'n4') return { ok: true, delay: 10 };
+      if (node === 'n0') return { ok: true, delay: 5 };
+      return new Promise((resolve) => setTimeout(() => resolve({ ok: false, reason: 'timeout' }), 200));
+    },
+    select: async (_group, tag) => { currentNow = tag; return { ok: true }; },
+  });
+  const monitor = createMonitor({
+    api,
+    config: { ...fastConfig, coldStartConcurrency: 2, backgroundRoundDeadlineMs: 100 },
+    clock: makeClock(0),
+    logger: makeLogger(),
+  });
+  await monitor.poolCycle(); // 快扫：n4 成功 → 部分发布 generation=1
+  assert.equal(monitor.getSnapshot().diagnostics.candidateSnapshot.generation, 1);
+
+  await monitor.poolCycle(); // 正常轮次：n4 成功 + 死节点慢超时 → 回滚拓扑但保留 scanPolicy
+  const afterNormal = monitor.getSnapshot();
+  // 正常轮次超时回滚不发布（generation 仍 1，避免泄漏半更新订阅），
+  // 但死节点失败计数保留累积（否则方案 D 指数退避永远无法生效）。
+  assert.equal(afterNormal.diagnostics.candidateSnapshot.generation, 1, JSON.stringify(afterNormal.diagnostics.candidateSnapshot));
+  const policy = afterNormal.diagnostics.scan.policy;
+  const n1State = policy.states.find(([t]) => t === 'n1');
+  assert.ok(n1State, 'n1 应有 scanPolicy 状态');
+  assert.equal(n1State[1].consecutiveFailures, 1, '正常轮次死节点失败计数应保留（不回滚清零）');
+});

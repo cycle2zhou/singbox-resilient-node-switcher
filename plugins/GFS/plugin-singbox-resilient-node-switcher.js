@@ -1490,8 +1490,11 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
       const encodedNode = encodeURIComponent(node);
       const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
       // 探测超时交给 sing-box 的 timeout 参数（超时返回 504）；fetch 端仅保留兜底超时，
-      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）
-      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 10);
+      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）。
+      // 兜底用 timeoutMs*3 而非 *10：死节点探测在 WebView 低并发连接池上串行排队，20s 兜底会让
+      // 单节点挂起 20s，187 节点快扫/25 节点正常轮次远超 5 分钟 deadline，且长期占用连接池导致
+      // watchCycle 读 /proxies 排队超时（失明）。3 倍兜底仍给 sing-box 内部开销（约 2.4 倍）留余量。
+      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 3);
       if (!result.ok) return result;
       return parseDelayResponse(result.status, result.body);
     },
@@ -2137,11 +2140,13 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     const snapshotCurrentNow = currentNow;
     const snapshotTopologyFingerprint = topologyFingerprint;
     const snapshotCurrentUrlTestGroup = currentUrlTestGroup;
-    const restorePoolSnapshot = () => {
+    const restorePoolSnapshot = (keepScanPolicy = false) => {
       nodeStates.clear();
       for (const [k, v] of snapshotStates) nodeStates.set(k, v);
       candidates = snapshotCandidates;
-      scanPolicy.restore(snapshotScanPolicy);
+      if (!keepScanPolicy) {
+        scanPolicy.restore(snapshotScanPolicy);
+      }
       members = snapshotMembers;
       memberTypes = snapshotMemberTypes;
       currentNow = snapshotCurrentNow;
@@ -2251,12 +2256,13 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
         let foregroundWaitMs = 0;
         if (cycleController.signal.aborted) {
           if (fastScan) {
-            // 冷启动快扫超时：保留已探测结果，发布部分候选池（渐进建立），
-            // 打破「超时回滚→candidateGeneration 不增→反复快扫」死循环。
+            // 冷启动快扫超时：保留已探测结果，发布部分候选池（渐进建立）。
             break;
           }
+          // 正常轮次超时：回滚拓扑+节点状态（不泄漏半更新订阅），但保留 scanPolicy
+          // （死节点 consecutiveFailures 累积，方案 D 指数退避才能生效）。
           schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-          restorePoolSnapshot();
+          restorePoolSnapshot(true);
           return { skipped: true, error: null };
         }
         // 冷启动快扫是建立候选池的关键路径，不应被前台探测（watchCycle/runRealProbe）占用
@@ -2277,7 +2283,7 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
               timeoutReason: lastTimeoutReason,
             };
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           i -= batchSize;
@@ -2315,8 +2321,9 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
               // 冷启动快扫超时：发布部分候选池（渐进建立），不回滚已探测结果。
               break;
             }
+            // 正常轮次超时：回滚拓扑+节点状态（不泄漏），保留 scanPolicy（死节点失败计数累积）。
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           restorePoolSnapshot();

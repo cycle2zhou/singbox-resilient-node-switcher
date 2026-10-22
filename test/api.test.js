@@ -169,8 +169,8 @@ test('真实 fetch 超时抛 AbortError 时仍归类为 request timeout', async 
 
 test('探测超时交给 sing-box timeout 参数，fetch 端兜底超时不提前 abort', async () => {
   // 回归保护：死节点由 sing-box 的 timeout 参数在 timeoutMs 后返回 504 判定，
-  // 而非 fetch 端在 timeoutMs 时 abort。fetch 端只保留 timeoutMs*10 的兜底超时，
-  // 避免 WKWebView 连接池排队期间活节点被短超时误 abort。
+  // 而非 fetch 端在 timeoutMs 时 abort。fetch 端只保留 timeoutMs*3 的兜底超时，
+  // 避免 WKWebView 连接池排队期间活节点被短超时误 abort，同时限制死节点挂起时长。
   const api = createClashApi({
     baseUrl: 'http://localhost:9090',
     fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
@@ -183,6 +183,26 @@ test('探测超时交给 sing-box timeout 参数，fetch 端兜底超时不提�
   assert.equal(result.ok, false);
   assert.match(result.reason, /504/);
   assert.doesNotMatch(result.reason, /timeout|abort/i);
+});
+
+test('死节点挂起时 fetch 兜底超时为 timeoutMs*3（限制挂起时长）', async () => {
+  // fetchImpl 永不返回（模拟死节点挂起），probe 应在 timeoutMs*3 兜底超时返回，
+  // 而非旧逻辑 timeoutMs*10（20s 兜底会让死节点长期占用 WebView 低并发连接池，
+  // 拖垮快扫/正常轮次并导致 watchCycle 读 /proxies 排队超时失明）。
+  const api = createClashApi({
+    baseUrl: 'http://localhost:9090',
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason));
+      // 永不返回，仅响应 abort
+    }),
+  });
+  const startedAt = Date.now();
+  const result = await api.probe('node', 'https://example.test', 100);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /timeout|abort/i);
+  // 兜底超时 = 100 * 3 = 300ms，应远小于旧 timeoutMs*10=1000ms
+  assert.ok(elapsed < 800, `兜底超时应在 ~300ms 触发，实际 ${elapsed}ms`);
 });
 
 test('realProbe 用 httpGetImpl 真实下载 body 并返回完整延迟', async () => {

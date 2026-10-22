@@ -95,8 +95,11 @@ export function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = 
       const encodedNode = encodeURIComponent(node);
       const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
       // 探测超时交给 sing-box 的 timeout 参数（超时返回 504）；fetch 端仅保留兜底超时，
-      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）
-      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 10);
+      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）。
+      // 兜底用 timeoutMs*3 而非 *10：死节点探测在 WebView 低并发连接池上串行排队，20s 兜底会让
+      // 单节点挂起 20s，187 节点快扫/25 节点正常轮次远超 5 分钟 deadline，且长期占用连接池导致
+      // watchCycle 读 /proxies 排队超时（失明）。3 倍兜底仍给 sing-box 内部开销（约 2.4 倍）留余量。
+      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 3);
       if (!result.ok) return result;
       return parseDelayResponse(result.status, result.body);
     },
