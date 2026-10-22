@@ -160,10 +160,28 @@ export default (Plugin) => {
       api: apiClient,
       config,
       clock: Date,
-      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）。
-      // 传 Connection: close 强制每次新建连接（含 TLS 握手），避免 Go http.Client 复用连接
-      // 跳过 TLS 握手导致延迟系统性低估（实测复用连接 ~0.7s vs 新建连接 1.7~4.6s）。
-      httpGetImpl: (url) => Plugins.HttpGet(url, { Connection: 'close' }),
+      // 真实延迟探测用 WebView fetch（globalThis.fetch）发起真实 GET 并完整下载响应体。
+      // 相比 native HttpGet（Plugins.HttpGet，Go http.Client 无超时参数），WebView fetch 是异步的
+      // （不阻塞 JS 主线程），配合 realProbe 的软超时（withTimeout）可正确兜底，避免 native 请求
+      // 挂起时阻塞主线程导致快扫/持久化定时器（setTimeout）失效、插件整体卡死。
+      // 系统代理已指向 127.0.0.1:20122（sing-box 混合入站），github.com 等外部域名走代理，
+      // 测到的仍是真实代理延迟。CORS 由 GFS webview（webSecurity 关闭）放行。
+      // cache: 'no-store' 避免 HTTP 缓存低估延迟；Connection 是 forbidden header 被 fetch 忽略，
+      // 可接受连接复用导致延迟略低，换取「不挂起」。
+      httpGetImpl: async (url) => {
+        const res = await globalThis.fetch(url, { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const text = await res.text();
+        let body = text;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          // 非 JSON（如 HTML）保持文本
+        }
+        return { body };
+      },
       logger: {
         info: (...args) => console.log(`[${Plugin.name}]`, ...args),
         warn: (...args) => console.warn(`[${Plugin.name}]`, ...args),

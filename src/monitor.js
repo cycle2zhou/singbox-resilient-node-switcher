@@ -23,6 +23,7 @@ import {
   recordProbeSuccess,
   recordProbeFailure,
   markCooldown,
+  isEligibleCandidate,
 } from './health-state.js';
 
 function silentLogger() {
@@ -48,6 +49,16 @@ function stableKey(tag) {
   if (typeof tag !== 'string') return tag;
   const m = tag.match(/^(.*?)\s*\|\s*\d+(?:\.\d+)?ms\b/);
   return m ? m[1].trim() : tag;
+}
+
+// 节点死亡判定：只匹配 503（TCP 连接失败 = 明确的节点死亡）。
+// 504（sing-box 探测超时）/timeout（fetch 超时）不在此列——它们既可能是节点慢（偶发抖动，
+// 实测日本01 间歇 504：第一次 504、第二次 200ms），也可能是探测 URL 被墙的全局故障，
+// 必须保留累积/熔断保护，避免把抖动误判为断网、或把健康节点误标记为失败。
+// 此判定用于 watchCycle 前台断网即时判定（poolCycle 全池熔断改用「无成功即熔断」，见下方）。
+function isNodeDeath(reason) {
+  const t = String(reason || '').toLowerCase();
+  return t.includes('503');
 }
 
 export function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
@@ -258,7 +269,15 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       try {
         // 外层软超时不能取消 GFS 原生请求；先等前一个原生请求真正结束，
         // 再启动下一个 URL，避免“上一个仍挂起、下一个已超时”的隐性并发。
-        if (serializeNative) await nativeHttpGetTail;
+        // 但 native 请求可能因当前节点不可用而永久挂起（走系统代理的 HttpGet 无取消机制），
+        // 死等会让 runRealProbe 卡住、foregroundInFlight 泄漏、后台快扫被 foreground-wait 阻塞。
+        // 因此等待加软超时兜底，超时后继续下一个 URL（每个 realProbe 自身仍有 withTimeout 保护）。
+        if (serializeNative) {
+          await Promise.race([
+            nativeHttpGetTail,
+            new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+          ]);
+        }
         results.push(await realProbe(url, timeoutMs, serializeNative ? serializedHttpGet : httpGetImpl));
       } catch (error) {
         results.push({ ok: false, reason: error?.message || String(error) });
@@ -402,7 +421,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     candidateStore,
     observeCurrent: () => ({ now: currentNow }),
     probeCandidate: async (tag, request = {}) => {
-      const check = await probeAny(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
+      const check = await probeAnyWithTimeout(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
       return check;
     },
     realProbe: async (_tag, options = {}) => {
@@ -523,7 +542,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     }, interval);
   }
 
-  async function runPoolProbe(tag, signal, urls) {
+  async function runPoolProbe(tag, signal, urls, fastScan = false) {
     const now = time.now();
     const state = ensureNodeState(tag);
     const plan = getProbePlan(state, now, cfg);
@@ -531,7 +550,16 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     if (!plan.shouldProbe) {
       return { tag, probed: false };
     }
-    const { ok, result } = await probeAny(tag, urls, cfg.poolTimeoutMs, signal);
+    // 冷启动快扫：用更短超时快速分辨死活（精确延迟交给后续正常轮次）。
+    // 死节点 504 在 sing-box 端默认 2s 才返回，短超时让 187 节点全量快扫从 ~7 分钟降到 ~3 分钟。
+    const probeTimeoutMs = fastScan ? cfg.coldStartTimeoutMs : cfg.poolTimeoutMs;
+    // 软超时兜底：WebView fetch 偶发挂起（不响应 abort，底层请求无法取消），Promise.race
+    // 让 runPoolProbe 不永久卡住。挂起的 fetch 会占用连接，但快扫一次性扫完即停止，
+    // 挂起请求最终被 GC，不会无限累积。
+    const { ok, result } = await Promise.race([
+      probeAny(tag, urls, probeTimeoutMs, signal),
+      new Promise((resolve) => setTimeout(() => resolve({ ok: false, result: { ok: false, reason: 'probe soft timeout' } }), probeTimeoutMs * 3)),
+    ]);
     if (ok) {
       nodeStates.set(tag, recordProbeSuccess(nodeStates.get(tag), now, result.delay, cfg));
       scanPolicy.recordProbe({ tag, ok: true, delay: result.delay, now });
@@ -540,7 +568,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     const reason = result?.reason || 'probe failed';
     nodeStates.set(tag, recordProbeFailure(nodeStates.get(tag), now, reason, cfg));
     scanPolicy.recordProbe({ tag, ok: false, reason, now });
-    return { tag, probed: true, ok: false };
+    return { tag, probed: true, ok: false, reason };
   }
 
   async function poolCycle() {
@@ -566,11 +594,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
     const snapshotCurrentNow = currentNow;
     const snapshotTopologyFingerprint = topologyFingerprint;
     const snapshotCurrentUrlTestGroup = currentUrlTestGroup;
-    const restorePoolSnapshot = () => {
+    const restorePoolSnapshot = (keepScanPolicy = false) => {
       nodeStates.clear();
       for (const [k, v] of snapshotStates) nodeStates.set(k, v);
       candidates = snapshotCandidates;
-      scanPolicy.restore(snapshotScanPolicy);
+      if (!keepScanPolicy) {
+        scanPolicy.restore(snapshotScanPolicy);
+      }
       members = snapshotMembers;
       memberTypes = snapshotMemberTypes;
       currentNow = snapshotCurrentNow;
@@ -643,11 +673,15 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       currentNow = selector.now;
 
       // 探测目标：评分策略控制后台预算；当前节点和候选始终强制保留，URLTest 不参与叶子探测。
+      // 冷启动快扫：首次成功发布候选快照前（candidateGeneration===0）全量探测建立 score 画像，
+      // 避免重启后死节点按成员顺序堵住好节点、候选池十几分钟为空。
+      const fastScan = candidateGeneration === 0;
       const policyTargets = scanPolicy.selectTargets({
         tags: members.filter((tag) => memberTypes[tag] !== 'URLTest'),
         currentNow,
         candidateTags: candidates,
         now: time.now(),
+        fastScan,
       });
       const probeTargets = policyTargets.filter((tag) => tag !== currentNow && memberTypes[tag] !== 'URLTest');
       lastScanTargetCount = probeTargets.length;
@@ -663,18 +697,32 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         return { skipped: true, error: targetState.reason };
       }
       schedulerState = targetState.state;
-      const urls = probeUrlSequence(poolCycleCount);
+      // 冷启动快扫：只用最稳定的最后一个探测 URL（github）快速分辨死活。
+      // 3 URL 并行 × poolConcurrency 会在 WebView 低并发连接池上排队，死节点 1s 超时
+      // 让 187 节点全量快扫远超 5 分钟 deadline；单 URL 把请求数降到 1/3，快扫 ~1.3 分钟完成。
+      const urls = fastScan ? [cfg.probeUrls[cfg.probeUrls.length - 1]] : probeUrlSequence(poolCycleCount);
       const results = [];
-      const batchSize = Math.min(schedulerState.backgroundBatchSize, schedulerState.backgroundConcurrency);
+      const batchSize = fastScan
+        ? Math.min(cfg.coldStartConcurrency, probeTargets.length)
+        : Math.min(schedulerState.backgroundBatchSize, schedulerState.backgroundConcurrency);
       for (let i = schedulerState.backgroundCursor; i < probeTargets.length; i += batchSize) {
         const batchStartedAt = time.now();
         let foregroundWaitMs = 0;
         if (cycleController.signal.aborted) {
+          if (fastScan) {
+            // 冷启动快扫超时：保留已探测结果，发布部分候选池（渐进建立）。
+            break;
+          }
+          // 正常轮次超时：回滚拓扑+节点状态（不泄漏半更新订阅），但保留 scanPolicy
+          // （死节点 consecutiveFailures 累积，方案 D 指数退避才能生效）。
           schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-          restorePoolSnapshot();
+          restorePoolSnapshot(true);
           return { skipped: true, error: null };
         }
-        if (schedulerState.foregroundInFlight > 0) {
+        // 冷启动快扫是建立候选池的关键路径，不应被前台探测（watchCycle/runRealProbe）占用
+        // foreground 预算而无限等待——尤其 runRealProbe 可能因当前节点不可用卡住导致
+        // foregroundInFlight 泄漏，快扫会死等。快扫时跳过 foreground 等待，让快扫尽快完成。
+        if (!fastScan && schedulerState.foregroundInFlight > 0) {
           const waitStartedAt = time.now();
           await new Promise((resolve) => setTimeout(resolve, 10));
           foregroundWaitMs += Math.max(0, time.now() - waitStartedAt);
@@ -689,7 +737,7 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
               timeoutReason: lastTimeoutReason,
             };
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           i -= batchSize;
@@ -698,11 +746,11 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         schedulerState = { ...schedulerState, backgroundCursor: i };
         const batch = probeTargets.slice(i, i + batchSize);
         try {
-          const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls)));
+          const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls, fastScan)));
+          results.push(...batchResults);
           if (cycleController.signal.aborted) {
             throw new DOMException('后台扫描轮次已到期', 'AbortError');
           }
-          results.push(...batchResults);
           lastBatchDiagnostics = {
             startedAt: batchStartedAt,
             durationMs: Math.max(0, time.now() - batchStartedAt),
@@ -723,8 +771,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
               targetCount: batch.length,
               timeoutReason: lastTimeoutReason,
             };
+            if (fastScan) {
+              // 冷启动快扫超时：发布部分候选池（渐进建立），不回滚已探测结果。
+              break;
+            }
+            // 正常轮次超时：回滚拓扑+节点状态（不泄漏），保留 scanPolicy（死节点失败计数累积）。
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           restorePoolSnapshot();
@@ -737,12 +790,13 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
         topologyFingerprint: topology.topologyFingerprint,
       }).state;
 
-      // 全池失败熔断：实际探测节点失败率超过阈值则本轮作废
+      // 全池失败熔断：仅当「无任何探测成功」时判定为探测基础设施故障（探测 URL 被墙 / API 挂）。
+      // 只要有任一节点成功，说明探测目标可达，失败均为节点真实死亡/超时，正常记录淘汰。
+      // （504 大量出现可能是死节点被短超时误判，而非全局故障，不能据此熔断作废整轮。）
       const probed = results.filter((r) => r.probed);
       if (probed.length > 0) {
-        const failures = probed.filter((r) => !r.ok).length;
-        const failureRate = failures / probed.length;
-        if (failureRate > cfg.poolFailureRateThreshold) {
+        const successCount = probed.filter((r) => r.ok).length;
+        if (successCount === 0) {
           restorePoolSnapshot();
           schedulerState = finishBackgroundBatch(schedulerState, {
             now: time.now(),
@@ -760,9 +814,15 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
       candidates = probeTargets
         .filter((tag) => {
           const st = nodeStates.get(tag);
-          return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
+          // 放宽到「可恢复」（healthy 或 suspect）：免费节点间歇性抖动（约 75% 时间 504）时，
+          // 单次失败会进入 suspect，若仅保留 healthy 会导致候选池在正常轮次被频繁清空、缩水到 1 个。
+          // suspect 节点 lastDelay 仍保留（上次成功），切换前会经 probeCandidate 复核，安全。
+          return st && isEligibleCandidate(st) && st.lastDelay != null;
         })
-        .sort((a, b) => (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity));
+        .sort((a, b) => {
+          const diff = (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity);
+          return diff !== 0 ? diff : a.localeCompare(b);
+        });
 
       candidateStore.setTopology(scanTopologyFingerprint);
       const candidateSnapshot = createCandidateSnapshot({
@@ -950,7 +1010,11 @@ export function createMonitor({ api, config, clock, logger, httpGetImpl = null }
           watchOptimizeCount = 0;
         }
       } else {
-        watchFailureCount += 1;
+        // 明确断网（503 连接失败）一次即判，无需累积 failureThreshold 次；
+        // 软失败（504 超时/timeout/延迟高/退化）仍走多次确认，避免把偶发抖动误判为断网。
+        watchFailureCount = isNodeDeath(result?.reason)
+          ? (stalking ? 1 : cfg.failureThreshold)
+          : watchFailureCount + 1;
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;

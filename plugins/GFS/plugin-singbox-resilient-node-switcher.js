@@ -13,11 +13,19 @@ const DEFAULT_CONFIG = Object.freeze({
     'https://www.google.com/generate_204',
     'https://github.com',
   ]),
-  watchIntervalMs: 10000,
+  watchIntervalMs: 5000,
   watchTimeoutMs: 4000,
   maxDelayMs: 2000,
   poolRefreshIntervalMs: 180000,
   poolTimeoutMs: 2000,
+  // 冷启动快扫探测超时：快扫只分辨死活（精确延迟交给后续正常轮次）。
+  // 实测（早上网络拥堵）健康节点（宝可梦 180ms）连接建立也需 >1s，1s 超时会把健康
+  // 节点误判 504 导致候选池空；3000ms 能正确区分好节点（成功）和死节点（504 超时）。
+  coldStartTimeoutMs: 3000,
+  // 冷启动快扫并发：WebView fetch 同 host 连接池并发有限（约 6），快扫并发过高会让
+  // 请求排队，偶发请求在排队中挂起（fetch 不响应 abort）导致快扫卡住。降到连接池上限
+  // 以下，187 节点全量快扫约 1 分钟完成且不排队。
+  coldStartConcurrency: 5,
   poolConcurrency: 20,
   poolFailureRateThreshold: 0.9,
   failureThreshold: 3,
@@ -34,10 +42,14 @@ const DEFAULT_CONFIG = Object.freeze({
   stalkProbeDelayMs: 2000,
   stalkSuccessThreshold: 2,
   preSwitchMaxProbe: 3,
+  preSwitchConcurrentProbe: 8,
   // 真实延迟探测：sing-box 的 /delay 用 HEAD 且不读 body，系统性低估真实 GET 访问延迟
   // （实测低 3~6 倍），导致 maxDelayMs 慢判定失效。真实延迟探测走系统代理（fetch 默认走
   // 系统代理，指向 sing-box 混合入站）发起真实 GET 并读 body，测到的就是用户实际感知延迟。
-  realProbeEnabled: true,
+  // 注意：GFS 插件运行在 webview，访问外部域名（走系统代理）的请求在出口节点故障/超时
+  // 时会同步桥接挂起并阻塞 JS 主线程，导致所有 setTimeout（探测软超时、持久化定时器）失效、
+  // 快扫整体卡死。因此默认关闭，改用本地 sing-box API 的 HEAD 探测（不访问外部域名、不挂起）。
+  realProbeEnabled: false,
   realProbeUrls: Object.freeze([
     'https://github.com',
     'https://www.google.com',
@@ -63,6 +75,9 @@ const DEFAULT_CONFIG = Object.freeze({
   scanScoreMediumThreshold: 80,
   scanScoreLowThreshold: 70,
   scanBackoffRounds: 6,
+  // 死节点指数退避上限（轮数）：连续失败 >= 3 次后退避指数增长，最终封顶到 64 轮
+  // （64 × scanIntervalMs=10s ≈ 10.7 分钟才复探一次），把死节点挤出正常轮次。
+  scanBackoffMaxRounds: 64,
   scanSuccessStep: 5,
   scanFailureStep: 15,
   scanHttp503Step: 10,
@@ -95,6 +110,7 @@ const POSITIVE_KEYS = [
   'maxDelayMs',
   'poolRefreshIntervalMs',
   'poolTimeoutMs',
+  'coldStartTimeoutMs',
   'initialCooldownMs',
   'minDwellMs',
   'degradationRatio',
@@ -115,6 +131,7 @@ const POSITIVE_KEYS = [
 ];
 
 const POSITIVE_INTEGER_KEYS = [
+  'coldStartConcurrency',
   'poolConcurrency',
   'failureThreshold',
   'recoveryThreshold',
@@ -124,6 +141,7 @@ const POSITIVE_INTEGER_KEYS = [
   'optimizeThreshold',
   'stalkSuccessThreshold',
   'preSwitchMaxProbe',
+  'preSwitchConcurrentProbe',
   'realSlowThreshold',
   'realProbeMinSuccesses',
   'realStalkSuccessThreshold',
@@ -140,6 +158,7 @@ const POSITIVE_INTEGER_KEYS = [
   'scanScoreMediumThreshold',
   'scanScoreLowThreshold',
   'scanBackoffRounds',
+  'scanBackoffMaxRounds',
   'scanSuccessStep',
   'scanFailureStep',
   'scanHttp503Step',
@@ -637,6 +656,19 @@ function intervalFor(score, config) {
   return config.scanBackoffRounds;
 }
 
+// 探测退避轮数：连续失败 >= 3 次后指数退避。
+// 死节点（CF-自建等）探测慢/挂起会拖垮整轮扫描，让正常轮次超时、候选快照过期。
+// 前 2 次失败仍按 score 分段退避（快速确认「真死」），第 3 次起退避指数增长
+// （6→12→24→48→64 轮），把死节点逐步挤出正常轮次的 eligible 集合，让正常轮次
+// 优先探测健康节点、快速完成，候选池持续刷新。
+function backoffRoundsFor(state, config) {
+  if (state.consecutiveFailures >= 3) {
+    const exponent = Math.min(state.consecutiveFailures - 2, 6);
+    return Math.min(config.scanBackoffRounds * (2 ** exponent), config.scanBackoffMaxRounds);
+  }
+  return intervalFor(state.score, config);
+}
+
 function failurePenalty(reason, config) {
   const text = String(reason || '').toLowerCase();
   if (text.includes('503')) return config.scanHttp503Step;
@@ -665,7 +697,7 @@ function createScanPolicy({ config, clock = Date } = {}) {
       const penalty = real ? config.scanRealFailureStep : failurePenalty(reason, config);
       state.score = Math.max(0, state.score - penalty);
     }
-    state.nextProbeAt = now + intervalFor(state.score, config) * config.scanIntervalMs;
+    state.nextProbeAt = now + backoffRoundsFor(state, config) * config.scanIntervalMs;
     return { ...state };
   }
 
@@ -686,9 +718,15 @@ function createScanPolicy({ config, clock = Date } = {}) {
     for (const [tag, state] of snapshotState.states) states.set(tag, { ...state });
   }
 
-  function selectTargets({ tags = [], currentNow = null, candidateTags = [], now = time.now() } = {}) {
+  function selectTargets({ tags = [], currentNow = null, candidateTags = [], now = time.now(), fastScan = false } = {}) {
     round += 1;
     const uniqueTags = [...new Set(tags)];
+    if (fastScan) {
+      // 快扫反转顺序：机场订阅通常把专线/高级节点（如宝可梦/linux）放在成员列表末尾，
+      // 免费死节点（CF-自建）靠前。反转后快扫先探测专线，快速建立候选池，避免死节点
+      // 堵在前面导致快扫在 deadline 内探测不到专线、候选池长期为空。
+      return uniqueTags.reverse();
+    }
     const forced = [];
     const addForced = (tag) => {
       if (tag && uniqueTags.includes(tag) && !forced.includes(tag)) forced.push(tag);
@@ -1074,12 +1112,16 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
   if (typeof observeCurrent !== 'function') throw new TypeError('observeCurrent is required');
   if (typeof realProbe !== 'function') throw new TypeError('realProbe is required');
   const time = clock && typeof clock.now === 'function' ? clock : Date;
+  // 等待态冷却时间：同一节点同一代候选池切换失败后，冷却期内不再重复尝试；
+  // 超过冷却期则重置等待态，允许重新尝试（免费节点间歇性抖动，候选可能已恢复）。
+  const WAITING_COOLDOWN_MS = 30000;
   let stopped = false;
   let serial = 0;
   let active = null;
   let pending = null;
   let waitingKey = null;
   let waitingGeneration = null;
+  let waitingSince = 0;
 
   function result(ok, fields = {}) { return { ok, ...fields }; }
 
@@ -1095,7 +1137,8 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     const priority = Number.isFinite(request?.priority) ? request.priority : (request?.reason === 'failure' ? 10 : 1);
     const snapshot = candidateStore.getSnapshot();
     const currentKey = stableKey(before.now);
-    if (waitingKey === currentKey && waitingGeneration === (snapshot?.generation ?? null)) {
+    if (waitingKey === currentKey && waitingGeneration === (snapshot?.generation ?? null)
+      && time.now() - waitingSince < WAITING_COOLDOWN_MS) {
       return result(false, { reason: 'no-available-node', requestId, switchId });
     }
     const allowExpired = request?.reason === 'failure' || priority >= 10;
@@ -1110,6 +1153,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
         if (stableKey(fallbackTag) === stableKey(before.now)) {
           waitingKey = currentKey;
           waitingGeneration = snapshot?.generation ?? null;
+          waitingSince = time.now();
           return result(false, { reason: 'no-available-node', requestId, switchId });
         }
         if (typeof fallbackTag === 'string') {
@@ -1119,6 +1163,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
           if (stableKey(now) === stableKey(fallbackTag)) {
             waitingKey = null;
             waitingGeneration = null;
+            waitingSince = 0;
             await onNowConfirmed?.(now);
             await onConfirmed?.({
               from: before.now,
@@ -1150,7 +1195,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     }
     const candidates = selection.candidates
       .filter((candidate) => stableKey(candidate.tag) !== stableKey(before.now))
-      .slice(0, Number(config?.preSwitchMaxProbe) || selection.candidates.length);
+      .slice(0, Number(config?.preSwitchConcurrentProbe) || Number(config?.preSwitchMaxProbe) || selection.candidates.length);
     const candidateGeneration = snapshot?.generation ?? null;
     let recheckedCount = 0;
     let successfulCount = 0;
@@ -1178,7 +1223,26 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
     let allowedCurrent = before.now;
     let confirmationFailed = false;
     const failedCandidateKeys = new Set();
-    for (const candidate of candidates) {
+    // 并发预探测：同时 HEAD 复核所有候选，筛出「当下可用」的，避免串行逐个复核 ~15s。
+    const probeResults = await Promise.all(candidates.map(async (candidate) => {
+      if (typeof probeCandidate !== 'function') return { candidate, ok: true };
+      recheckedCount += 1;
+      try {
+        const probe = await probeCandidate(candidate.tag, request);
+        if (!probe?.ok) {
+          failedCount += 1;
+          failedCandidateKeys.add(stableKey(candidate.tag));
+          return { candidate, ok: false };
+        }
+        return { candidate, ok: true };
+      } catch {
+        failedCount += 1;
+        failedCandidateKeys.add(stableKey(candidate.tag));
+        return { candidate, ok: false };
+      }
+    }));
+    const readyCandidates = probeResults.filter((probe) => probe.ok).map((probe) => probe.candidate);
+    for (const candidate of readyCandidates) {
       const candidateKey = stableKey(candidate.tag);
       if (failedCandidateKeys.has(candidateKey)) continue;
       const observed = observeCurrent();
@@ -1186,15 +1250,6 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
         return result(false, { reason: 'current node changed', requestId, switchId });
       }
       try {
-        if (typeof probeCandidate === 'function') {
-          recheckedCount += 1;
-          const probe = await probeCandidate(candidate.tag, request);
-          if (!probe?.ok) {
-            failedCount += 1;
-            failedCandidateKeys.add(candidateKey);
-            continue;
-          }
-        }
         // 唯一的 Selector PUT 调用点：切换后立即确认 now，再用真实 GET 验证目标。
         await selectNode(candidate.tag);
         const confirmed = await api.getProxies();
@@ -1253,6 +1308,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
       if (stableKey(fallbackTag) === stableKey(before.now)) {
         waitingKey = currentKey;
         waitingGeneration = snapshot?.generation ?? null;
+        waitingSince = time.now();
         return result(false, { reason: 'no-available-node', requestId, switchId });
       }
       if (typeof fallbackTag === 'string') {
@@ -1263,6 +1319,7 @@ function createSwitchCoordinator({ api, config, clock = Date, logger = {}, candi
           if (stableKey(now) === stableKey(fallbackTag)) {
             waitingKey = null;
             waitingGeneration = null;
+            waitingSince = 0;
             await onNowConfirmed?.(now);
             await onConfirmed?.({
               from: before.now,
@@ -1442,8 +1499,11 @@ function createClashApi({ baseUrl, secret, timeoutMs = 5000, fetchImpl = globalT
       const encodedNode = encodeURIComponent(node);
       const query = new URLSearchParams({ url, timeout: String(timeoutMs) });
       // 探测超时交给 sing-box 的 timeout 参数（超时返回 504）；fetch 端仅保留兜底超时，
-      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）
-      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 10);
+      // 避免 WebView 连接池排队期间被短超时误 abort（timeoutMs 只作 sing-box 端超时，不作 fetch abort）。
+      // 兜底用 timeoutMs*3 而非 *10：死节点探测在 WebView 低并发连接池上串行排队，20s 兜底会让
+      // 单节点挂起 20s，187 节点快扫/25 节点正常轮次远超 5 分钟 deadline，且长期占用连接池导致
+      // watchCycle 读 /proxies 排队超时（失明）。3 倍兜底仍给 sing-box 内部开销（约 2.4 倍）留余量。
+      const result = await request(`/proxies/${encodedNode}/delay?${query}`, {}, signal, timeoutMs * 3);
       if (!result.ok) return result;
       return parseDelayResponse(result.status, result.body);
     },
@@ -1544,6 +1604,16 @@ function stableKey(tag) {
   if (typeof tag !== 'string') return tag;
   const m = tag.match(/^(.*?)\s*\|\s*\d+(?:\.\d+)?ms\b/);
   return m ? m[1].trim() : tag;
+}
+
+// 节点死亡判定：只匹配 503（TCP 连接失败 = 明确的节点死亡）。
+// 504（sing-box 探测超时）/timeout（fetch 超时）不在此列——它们既可能是节点慢（偶发抖动，
+// 实测日本01 间歇 504：第一次 504、第二次 200ms），也可能是探测 URL 被墙的全局故障，
+// 必须保留累积/熔断保护，避免把抖动误判为断网、或把健康节点误标记为失败。
+// 此判定用于 watchCycle 前台断网即时判定（poolCycle 全池熔断改用「无成功即熔断」，见下方）。
+function isNodeDeath(reason) {
+  const t = String(reason || '').toLowerCase();
+  return t.includes('503');
 }
 
 function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
@@ -1754,7 +1824,15 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
       try {
         // 外层软超时不能取消 GFS 原生请求；先等前一个原生请求真正结束，
         // 再启动下一个 URL，避免“上一个仍挂起、下一个已超时”的隐性并发。
-        if (serializeNative) await nativeHttpGetTail;
+        // 但 native 请求可能因当前节点不可用而永久挂起（走系统代理的 HttpGet 无取消机制），
+        // 死等会让 runRealProbe 卡住、foregroundInFlight 泄漏、后台快扫被 foreground-wait 阻塞。
+        // 因此等待加软超时兜底，超时后继续下一个 URL（每个 realProbe 自身仍有 withTimeout 保护）。
+        if (serializeNative) {
+          await Promise.race([
+            nativeHttpGetTail,
+            new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+          ]);
+        }
         results.push(await realProbe(url, timeoutMs, serializeNative ? serializedHttpGet : httpGetImpl));
       } catch (error) {
         results.push({ ok: false, reason: error?.message || String(error) });
@@ -1898,7 +1976,7 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     candidateStore,
     observeCurrent: () => ({ now: currentNow }),
     probeCandidate: async (tag, request = {}) => {
-      const check = await probeAny(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
+      const check = await probeAnyWithTimeout(tag, probeUrlSequence(watchCycleCount + (request.attempt || 0)), cfg.watchTimeoutMs, watchController?.signal);
       return check;
     },
     realProbe: async (_tag, options = {}) => {
@@ -2019,7 +2097,7 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     }, interval);
   }
 
-  async function runPoolProbe(tag, signal, urls) {
+  async function runPoolProbe(tag, signal, urls, fastScan = false) {
     const now = time.now();
     const state = ensureNodeState(tag);
     const plan = getProbePlan(state, now, cfg);
@@ -2027,7 +2105,16 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     if (!plan.shouldProbe) {
       return { tag, probed: false };
     }
-    const { ok, result } = await probeAny(tag, urls, cfg.poolTimeoutMs, signal);
+    // 冷启动快扫：用更短超时快速分辨死活（精确延迟交给后续正常轮次）。
+    // 死节点 504 在 sing-box 端默认 2s 才返回，短超时让 187 节点全量快扫从 ~7 分钟降到 ~3 分钟。
+    const probeTimeoutMs = fastScan ? cfg.coldStartTimeoutMs : cfg.poolTimeoutMs;
+    // 软超时兜底：WebView fetch 偶发挂起（不响应 abort，底层请求无法取消），Promise.race
+    // 让 runPoolProbe 不永久卡住。挂起的 fetch 会占用连接，但快扫一次性扫完即停止，
+    // 挂起请求最终被 GC，不会无限累积。
+    const { ok, result } = await Promise.race([
+      probeAny(tag, urls, probeTimeoutMs, signal),
+      new Promise((resolve) => setTimeout(() => resolve({ ok: false, result: { ok: false, reason: 'probe soft timeout' } }), probeTimeoutMs * 3)),
+    ]);
     if (ok) {
       nodeStates.set(tag, recordProbeSuccess(nodeStates.get(tag), now, result.delay, cfg));
       scanPolicy.recordProbe({ tag, ok: true, delay: result.delay, now });
@@ -2036,7 +2123,7 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     const reason = result?.reason || 'probe failed';
     nodeStates.set(tag, recordProbeFailure(nodeStates.get(tag), now, reason, cfg));
     scanPolicy.recordProbe({ tag, ok: false, reason, now });
-    return { tag, probed: true, ok: false };
+    return { tag, probed: true, ok: false, reason };
   }
 
   async function poolCycle() {
@@ -2062,11 +2149,13 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
     const snapshotCurrentNow = currentNow;
     const snapshotTopologyFingerprint = topologyFingerprint;
     const snapshotCurrentUrlTestGroup = currentUrlTestGroup;
-    const restorePoolSnapshot = () => {
+    const restorePoolSnapshot = (keepScanPolicy = false) => {
       nodeStates.clear();
       for (const [k, v] of snapshotStates) nodeStates.set(k, v);
       candidates = snapshotCandidates;
-      scanPolicy.restore(snapshotScanPolicy);
+      if (!keepScanPolicy) {
+        scanPolicy.restore(snapshotScanPolicy);
+      }
       members = snapshotMembers;
       memberTypes = snapshotMemberTypes;
       currentNow = snapshotCurrentNow;
@@ -2139,11 +2228,15 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
       currentNow = selector.now;
 
       // 探测目标：评分策略控制后台预算；当前节点和候选始终强制保留，URLTest 不参与叶子探测。
+      // 冷启动快扫：首次成功发布候选快照前（candidateGeneration===0）全量探测建立 score 画像，
+      // 避免重启后死节点按成员顺序堵住好节点、候选池十几分钟为空。
+      const fastScan = candidateGeneration === 0;
       const policyTargets = scanPolicy.selectTargets({
         tags: members.filter((tag) => memberTypes[tag] !== 'URLTest'),
         currentNow,
         candidateTags: candidates,
         now: time.now(),
+        fastScan,
       });
       const probeTargets = policyTargets.filter((tag) => tag !== currentNow && memberTypes[tag] !== 'URLTest');
       lastScanTargetCount = probeTargets.length;
@@ -2159,18 +2252,32 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
         return { skipped: true, error: targetState.reason };
       }
       schedulerState = targetState.state;
-      const urls = probeUrlSequence(poolCycleCount);
+      // 冷启动快扫：只用最稳定的最后一个探测 URL（github）快速分辨死活。
+      // 3 URL 并行 × poolConcurrency 会在 WebView 低并发连接池上排队，死节点 1s 超时
+      // 让 187 节点全量快扫远超 5 分钟 deadline；单 URL 把请求数降到 1/3，快扫 ~1.3 分钟完成。
+      const urls = fastScan ? [cfg.probeUrls[cfg.probeUrls.length - 1]] : probeUrlSequence(poolCycleCount);
       const results = [];
-      const batchSize = Math.min(schedulerState.backgroundBatchSize, schedulerState.backgroundConcurrency);
+      const batchSize = fastScan
+        ? Math.min(cfg.coldStartConcurrency, probeTargets.length)
+        : Math.min(schedulerState.backgroundBatchSize, schedulerState.backgroundConcurrency);
       for (let i = schedulerState.backgroundCursor; i < probeTargets.length; i += batchSize) {
         const batchStartedAt = time.now();
         let foregroundWaitMs = 0;
         if (cycleController.signal.aborted) {
+          if (fastScan) {
+            // 冷启动快扫超时：保留已探测结果，发布部分候选池（渐进建立）。
+            break;
+          }
+          // 正常轮次超时：回滚拓扑+节点状态（不泄漏半更新订阅），但保留 scanPolicy
+          // （死节点 consecutiveFailures 累积，方案 D 指数退避才能生效）。
           schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-          restorePoolSnapshot();
+          restorePoolSnapshot(true);
           return { skipped: true, error: null };
         }
-        if (schedulerState.foregroundInFlight > 0) {
+        // 冷启动快扫是建立候选池的关键路径，不应被前台探测（watchCycle/runRealProbe）占用
+        // foreground 预算而无限等待——尤其 runRealProbe 可能因当前节点不可用卡住导致
+        // foregroundInFlight 泄漏，快扫会死等。快扫时跳过 foreground 等待，让快扫尽快完成。
+        if (!fastScan && schedulerState.foregroundInFlight > 0) {
           const waitStartedAt = time.now();
           await new Promise((resolve) => setTimeout(resolve, 10));
           foregroundWaitMs += Math.max(0, time.now() - waitStartedAt);
@@ -2185,7 +2292,7 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
               timeoutReason: lastTimeoutReason,
             };
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           i -= batchSize;
@@ -2194,11 +2301,11 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
         schedulerState = { ...schedulerState, backgroundCursor: i };
         const batch = probeTargets.slice(i, i + batchSize);
         try {
-          const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls)));
+          const batchResults = await Promise.all(batch.map((tag) => runPoolProbe(tag, cycleController.signal, urls, fastScan)));
+          results.push(...batchResults);
           if (cycleController.signal.aborted) {
             throw new DOMException('后台扫描轮次已到期', 'AbortError');
           }
-          results.push(...batchResults);
           lastBatchDiagnostics = {
             startedAt: batchStartedAt,
             durationMs: Math.max(0, time.now() - batchStartedAt),
@@ -2219,8 +2326,13 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
               targetCount: batch.length,
               timeoutReason: lastTimeoutReason,
             };
+            if (fastScan) {
+              // 冷启动快扫超时：发布部分候选池（渐进建立），不回滚已探测结果。
+              break;
+            }
+            // 正常轮次超时：回滚拓扑+节点状态（不泄漏），保留 scanPolicy（死节点失败计数累积）。
             schedulerState = expireBackgroundRound(schedulerState, { now: time.now(), cursor: i }).state;
-            restorePoolSnapshot();
+            restorePoolSnapshot(true);
             return { skipped: true, error: null };
           }
           restorePoolSnapshot();
@@ -2233,12 +2345,13 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
         topologyFingerprint: topology.topologyFingerprint,
       }).state;
 
-      // 全池失败熔断：实际探测节点失败率超过阈值则本轮作废
+      // 全池失败熔断：仅当「无任何探测成功」时判定为探测基础设施故障（探测 URL 被墙 / API 挂）。
+      // 只要有任一节点成功，说明探测目标可达，失败均为节点真实死亡/超时，正常记录淘汰。
+      // （504 大量出现可能是死节点被短超时误判，而非全局故障，不能据此熔断作废整轮。）
       const probed = results.filter((r) => r.probed);
       if (probed.length > 0) {
-        const failures = probed.filter((r) => !r.ok).length;
-        const failureRate = failures / probed.length;
-        if (failureRate > cfg.poolFailureRateThreshold) {
+        const successCount = probed.filter((r) => r.ok).length;
+        if (successCount === 0) {
           restorePoolSnapshot();
           schedulerState = finishBackgroundBatch(schedulerState, {
             now: time.now(),
@@ -2256,9 +2369,15 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
       candidates = probeTargets
         .filter((tag) => {
           const st = nodeStates.get(tag);
-          return st && st.status === 'healthy' && st.lastDelay != null && st.lastError == null;
+          // 放宽到「可恢复」（healthy 或 suspect）：免费节点间歇性抖动（约 75% 时间 504）时，
+          // 单次失败会进入 suspect，若仅保留 healthy 会导致候选池在正常轮次被频繁清空、缩水到 1 个。
+          // suspect 节点 lastDelay 仍保留（上次成功），切换前会经 probeCandidate 复核，安全。
+          return st && isEligibleCandidate(st) && st.lastDelay != null;
         })
-        .sort((a, b) => (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity));
+        .sort((a, b) => {
+          const diff = (nodeStates.get(a)?.lastDelay ?? Infinity) - (nodeStates.get(b)?.lastDelay ?? Infinity);
+          return diff !== 0 ? diff : a.localeCompare(b);
+        });
 
       candidateStore.setTopology(scanTopologyFingerprint);
       const candidateSnapshot = createCandidateSnapshot({
@@ -2446,7 +2565,11 @@ function createMonitor({ api, config, clock, logger, httpGetImpl = null }) {
           watchOptimizeCount = 0;
         }
       } else {
-        watchFailureCount += 1;
+        // 明确断网（503 连接失败）一次即判，无需累积 failureThreshold 次；
+        // 软失败（504 超时/timeout/延迟高/退化）仍走多次确认，避免把偶发抖动误判为断网。
+        watchFailureCount = isNodeDeath(result?.reason)
+          ? (stalking ? 1 : cfg.failureThreshold)
+          : watchFailureCount + 1;
         watchDegradationCount = 0;
         watchOptimizeCount = 0;
         watchSlowCount = 0;
@@ -2833,10 +2956,28 @@ export default (Plugin) => {
       api: apiClient,
       config,
       clock: Date,
-      // 真实延迟探测用 native 层 HttpGet（无 CORS，默认走系统代理 20122 测真实代理延迟）。
-      // 传 Connection: close 强制每次新建连接（含 TLS 握手），避免 Go http.Client 复用连接
-      // 跳过 TLS 握手导致延迟系统性低估（实测复用连接 ~0.7s vs 新建连接 1.7~4.6s）。
-      httpGetImpl: (url) => Plugins.HttpGet(url, { Connection: 'close' }),
+      // 真实延迟探测用 WebView fetch（globalThis.fetch）发起真实 GET 并完整下载响应体。
+      // 相比 native HttpGet（Plugins.HttpGet，Go http.Client 无超时参数），WebView fetch 是异步的
+      // （不阻塞 JS 主线程），配合 realProbe 的软超时（withTimeout）可正确兜底，避免 native 请求
+      // 挂起时阻塞主线程导致快扫/持久化定时器（setTimeout）失效、插件整体卡死。
+      // 系统代理已指向 127.0.0.1:20122（sing-box 混合入站），github.com 等外部域名走代理，
+      // 测到的仍是真实代理延迟。CORS 由 GFS webview（webSecurity 关闭）放行。
+      // cache: 'no-store' 避免 HTTP 缓存低估延迟；Connection 是 forbidden header 被 fetch 忽略，
+      // 可接受连接复用导致延迟略低，换取「不挂起」。
+      httpGetImpl: async (url) => {
+        const res = await globalThis.fetch(url, { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const text = await res.text();
+        let body = text;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          // 非 JSON（如 HTML）保持文本
+        }
+        return { body };
+      },
       logger: {
         info: (...args) => console.log(`[${Plugin.name}]`, ...args),
         warn: (...args) => console.warn(`[${Plugin.name}]`, ...args),
